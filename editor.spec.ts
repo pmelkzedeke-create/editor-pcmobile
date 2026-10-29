@@ -1,0 +1,77 @@
+import { expect, test } from '@playwright/test';
+
+test('timeline preview, work area, cache, keyframes and history work together', async ({ page }) => {
+  const errors: string[] = [];
+  page.on('pageerror', (error) => errors.push(error.message));
+  await page.goto('/');
+  // This spec asserts exact MANUAL work-area frame counts. Automatic mode has
+  // separate coverage in vision.spec.ts and intentionally caches outside B..N.
+  await page.getByRole('button', { name: 'Cache automatico da timeline' }).click();
+  const clearCache = page.getByLabel('Limpar cache da previa', { exact: true });
+  if (await clearCache.isEnabled()) await clearCache.click();
+  await page.evaluate(() => (document.activeElement as HTMLElement)?.blur());
+  const monitor = page.getByTestId('program-monitor');
+  await expect(monitor).toBeVisible();
+  await expect.poll(() => monitor.evaluate((canvas: HTMLCanvasElement) => {
+    const pixels = canvas.getContext('2d')!.getImageData(0, 0, canvas.width, canvas.height).data;
+    let total = 0;
+    for (let i = 0; i < pixels.length; i += 400) total += pixels[i] + pixels[i + 1] + pixels[i + 2];
+    return total;
+  })).toBeGreaterThan(10000);
+  await page.screenshot({ path: 'test-results/editor-timeline.png' });
+
+  await page.keyboard.press('Home');
+  await page.keyboard.press('b');
+  await page.keyboard.press('ArrowRight');
+  for (let i = 0; i < 44; i++) await page.keyboard.press('ArrowRight');
+  await page.keyboard.press('n');
+  await page.getByRole('button', { name: /Renderizar previa/ }).click();
+  await expect(page.getByRole('status')).toContainText('45 quadros');
+  await expect(page.getByTestId('cached-range')).toHaveCount(1);
+  await page.getByRole('button', { name: 'Reproduzir area de trabalho', exact: true }).click();
+  await page.waitForTimeout(800);
+  await expect(page.locator('.monitor-cache-label')).toContainText('Cache');
+  await page.getByRole('button', { name: 'Reproduzir area de trabalho', exact: true }).click();
+  await page.getByRole('button', { name: 'Time Remapping', exact: true }).click();
+  await expect(page.getByTestId('time-remap-editor')).toBeVisible();
+  await page.getByRole('switch', { name: 'Ativar Time Remapping' }).click();
+  await expect(page.getByRole('switch')).toHaveAttribute('aria-checked', 'true');
+  await expect(page.getByRole('status')).toContainText('Previa em tempo real');
+  await expect(page.getByRole('button', { name: /^Keyframe \d/ })).toHaveCount(2);
+  await page.getByRole('button', { name: 'Speed Ramp', exact: true }).click();
+  await expect(page.getByRole('button', { name: /^Keyframe \d/ })).toHaveCount(4);
+  await page.getByRole('button', { name: 'Adicionar keyframe', exact: true }).click();
+  await expect(page.getByRole('button', { name: /^Keyframe \d/ })).toHaveCount(5);
+  await page.locator('.remap-graph').press('F9');
+  await expect(page.getByLabel('Interpolacao do keyframe')).toHaveValue('bezier');
+  const key = page.getByRole('button', { name: /^Keyframe 2,/ });
+  const box = await key.boundingBox();
+  if (!box) throw new Error('Keyframe missing');
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width / 2 + 20, box.y + box.height / 2 - 10, { steps: 5 });
+  await page.mouse.up();
+  await expect(page.getByLabel('Tempo de origem do keyframe')).toBeVisible();
+  await page.keyboard.press('Control+z');
+  await expect(page.getByRole('button', { name: /^Keyframe \d/ })).toHaveCount(5);
+  await page.getByRole('button', { name: 'Reverso', exact: true }).click();
+  await expect(page.locator('.remap-readout small')).toContainText('-1.00x');
+  await page.getByRole('button', { name: 'Congelar', exact: true }).click();
+  await expect(page.locator('.remap-readout small')).toContainText('Congelado');
+  await page.getByRole('button', { name: 'Restaurar tempo original', exact: true }).click();
+  await page.getByRole('button', { name: 'Speed Ramp', exact: true }).click();
+  await page.screenshot({ path: 'test-results/editor-remapping.png' });
+  await page.getByRole('button', { name: 'Velocidade', exact: true }).click();
+  await expect(page.locator('.remap-axis-title')).toContainText('VELOCIDADE');
+  await page.getByRole('button', { name: 'Grafico de valor', exact: true }).click();
+  await page.getByRole('button', { name: 'Timeline', exact: true }).click();
+  await page.getByRole('button', { name: /Renderizar previa/ }).click();
+  await expect(page.getByRole('status')).toContainText('45 quadros');
+  await page.getByLabel('Qualidade da previa').selectOption('4');
+  await expect(monitor).toHaveAttribute('width', '320');
+  await expect(page.getByTestId('cached-range')).toHaveCount(0);
+  await page.getByTitle('Ampliar monitor', { exact: true }).click();
+  await expect(page.locator('.studio-workspace > aside').first()).not.toBeVisible();
+  await page.getByTitle('Mostrar paineis', { exact: true }).click();
+  expect(errors).toEqual([]);
+});

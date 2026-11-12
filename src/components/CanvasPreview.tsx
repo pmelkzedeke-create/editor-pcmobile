@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  Activity,
   ChevronFirst,
   ChevronLast,
   ChevronLeft,
@@ -12,6 +13,7 @@ import {
   Pause,
   Play,
   Repeat,
+  RotateCw,
   Volume2,
   VolumeX,
   Scan,
@@ -36,6 +38,13 @@ import { prepareMediaFrame } from '../utils/previewCache';
 import type { PreviewFrameCache } from '../utils/previewCache';
 import type { PreviewRenderState } from '../hooks/usePreviewRender';
 import { MotionToolsPanel } from './MotionToolsPanel';
+import { AudioVuMeter } from './AudioVuMeter';
+import { VideoScopesPanel } from './VideoScopesPanel';
+import {
+  buildRotationGizmoPatch,
+  buildScaleGizmoPatch,
+  snapCanvasPosition,
+} from '../utils/canvasGizmos';
 
 interface CanvasPreviewProps {
   onAnalysisBusy: (busy: boolean) => void;
@@ -101,14 +110,21 @@ export const CanvasPreview: React.FC<CanvasPreviewProps> = ({
   const containerRef = useRef<HTMLDivElement>(null);
   const stageWrapperRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const backbufferRef = useRef<HTMLCanvasElement | null>(null);
   const boundsRef = useRef<RenderedClipBounds[]>([]);
 
   const [stageSize, setStageSize] = useState({ width: 640, height: 360 });
   const [viewZoom, setViewZoom] = useState<'fit' | number>('fit');
   const [frameError, setFrameError] = useState<string | null>(null);
   const [showGuides, setShowGuides] = useState(false);
+  const [showScopes, setShowScopes] = useState(false);
+  const [falseColor, setFalseColor] = useState(false);
   const [cursorCoords, setCursorCoords] = useState<{ x: number; y: number } | null>(null);
   const [selectedBox, setSelectedBox] = useState<RenderedClipBounds | null>(null);
+  const [snapGuides, setSnapGuides] = useState<{ x: number | null; y: number | null }>({
+    x: null,
+    y: null,
+  });
   const [editingTextClipId, setEditingTextClipId] = useState<string | null>(null);
   const [showVision, setShowVision] = useState(false);
   useEffect(() => { setShowVision(false); }, [selectedClipId]);
@@ -149,51 +165,85 @@ export const CanvasPreview: React.FC<CanvasPreviewProps> = ({
     return () => observer.disconnect();
   }, [spec.width, spec.height, viewZoom, isMobile]);
 
+  const isCurrentFrameCached = previewCache.has(displayTime);
+  void previewState.frameCount;
+
   useEffect(() => {
     const canvas = canvasRef.current;
     const context = canvas?.getContext('2d', { alpha: true });
     if (!canvas || !context) return;
+    if (!backbufferRef.current) {
+      backbufferRef.current = document.createElement('canvas');
+    }
+    const backbuffer = backbufferRef.current;
+    if (backbuffer.width !== renderWidth || backbuffer.height !== renderHeight) {
+      backbuffer.width = renderWidth;
+      backbuffer.height = renderHeight;
+    }
+    const backCtx = backbuffer.getContext('2d', { alpha: true });
+    if (!backCtx) return;
+
     let cancelled = false;
     const controller = new AbortController();
+
+    const blitToMonitor = (source: CanvasImageSource) => {
+      context.save();
+      context.setTransform(1, 0, 0, 1, 0, 0);
+      context.globalAlpha = 1;
+      context.globalCompositeOperation = 'copy';
+      context.drawImage(source, 0, 0, renderWidth, renderHeight);
+      context.restore();
+    };
+
     const setBounds = (bounds: RenderedClipBounds[]) => {
       boundsRef.current = bounds;
       setSelectedBox(
         selectedClipId ? bounds.find((box) => box.clipId === selectedClipId) || null : null
       );
     };
+
     const drawLive = () => {
-      if (cancelled || previewCache.has(displayTime)) return;
-      setBounds(
-        renderFrameToCanvas(
-          context,
-          renderWidth,
-          renderHeight,
-          tracks,
-          clips,
-          assetsMap,
-          pool,
-          displayTime,
-          {
-            backgroundColor: project.backgroundColor,
-            transparentBg: project.transparentBg,
-            fps,
-            compositions: project.compositions,
-          }
-        )
+      if (cancelled) return;
+      const bounds = renderFrameToCanvas(
+        backCtx,
+        renderWidth,
+        renderHeight,
+        tracks,
+        clips,
+        assetsMap,
+        pool,
+        displayTime,
+        {
+          backgroundColor: project.backgroundColor,
+          transparentBg: project.transparentBg,
+          fps,
+          compositions: project.compositions,
+        }
       );
+      blitToMonitor(backbuffer);
+      setBounds(bounds);
     };
+
     const draw = async () => {
       if (previewCache.has(displayTime)) {
-        const bitmap =
-          previewCache.peek(displayTime) ||
-          (await previewCache.decode(previewCache.frameIndex(displayTime)));
+        const syncBitmap = previewCache.peek(displayTime);
+        if (syncBitmap) {
+          blitToMonitor(syncBitmap);
+          setBounds(previewCache.bounds(displayTime));
+          previewCache.prefetch(displayTime);
+          return;
+        }
+        // Fallback immediate draw so monitor never blinks while decoding a cold cached blob
+        drawLive();
+        const bitmap = await previewCache.decode(previewCache.frameIndex(displayTime));
         if (!cancelled && bitmap) {
-          context.clearRect(0, 0, renderWidth, renderHeight);
-          context.drawImage(bitmap, 0, 0, renderWidth, renderHeight);
+          blitToMonitor(bitmap);
           setBounds(previewCache.bounds(displayTime));
         }
         previewCache.prefetch(displayTime);
       } else if (!isPlaying) {
+        // Immediate synchronous paint from warm media pool, then refine after exact video seek
+        drawLive();
         await prepareMediaFrame(
           {
             ...project,
@@ -205,14 +255,20 @@ export const CanvasPreview: React.FC<CanvasPreviewProps> = ({
           displayTime,
           controller.signal
         );
-        drawLive();
+        if (!cancelled && !previewCache.has(displayTime)) {
+          drawLive();
+        }
       } else {
         drawLive();
       }
     };
-    const unsubscribe = pool.subscribe(drawLive);
+
+    const onPoolUpdate = () => {
+      if (!cancelled && !previewCache.has(displayTime)) drawLive();
+    };
+    const unsubscribe = pool.subscribe(onPoolUpdate);
     // WebGL context restored after the OS reclaimed it (common on phones): redraw 3D layers.
-    window.addEventListener('otto-3d-restored', drawLive);
+    window.addEventListener('otto-3d-restored', onPoolUpdate);
     setFrameError(null);
     void draw().catch((error) => {
       if (!cancelled && !controller.signal.aborted) {
@@ -220,13 +276,13 @@ export const CanvasPreview: React.FC<CanvasPreviewProps> = ({
       }
     });
     void document.fonts.ready.then(() => {
-      if (!cancelled) drawLive();
+      if (!cancelled && !previewCache.has(displayTime)) drawLive();
     });
     return () => {
       cancelled = true;
       controller.abort();
       unsubscribe();
-      window.removeEventListener('otto-3d-restored', drawLive);
+      window.removeEventListener('otto-3d-restored', onPoolUpdate);
     };
   }, [
     project,
@@ -240,7 +296,7 @@ export const CanvasPreview: React.FC<CanvasPreviewProps> = ({
     selectedClipId,
     isPlaying,
     previewCache,
-    previewState.frameCount,
+    isCurrentFrameCached,
     fps,
   ]);
 
@@ -310,8 +366,19 @@ export const CanvasPreview: React.FC<CanvasPreviewProps> = ({
       const dxPct = ((ev.clientX - st.startClientX) / Math.max(1, rect.width)) * 100;
       const dyPct = ((ev.clientY - st.startClientY) / Math.max(1, rect.height)) * 100;
       st.moved = true;
-      const nx = Math.round((st.origX + dxPct) * 10) / 10;
-      const ny = Math.round((st.origY + dyPct) * 10) / 10;
+      const rawX = st.origX + dxPct;
+      const rawY = st.origY + dyPct;
+      const activeVisualClips = clips.filter(
+        (c) =>
+          c.enabled !== false &&
+          c.type !== 'audio' &&
+          displayTime >= c.startTime &&
+          displayTime < c.startTime + c.duration
+      );
+      const snapped = snapCanvasPosition(rawX, rawY, activeVisualClips, st.clipId, ev.altKey);
+      const nx = snapped.x;
+      const ny = snapped.y;
+      setSnapGuides({ x: snapped.snapLineX, y: snapped.snapLineY });
 
       const latestClip = clips.find((c) => c.id === st.clipId);
       const localT = latestClip ? Math.max(0, displayTime - latestClip.startTime) : 0;
@@ -337,6 +404,7 @@ export const CanvasPreview: React.FC<CanvasPreviewProps> = ({
     };
 
     const onUp = () => {
+      setSnapGuides({ x: null, y: null });
       if (dragStateRef.current?.moved) {
         onCommitHistory();
       }
@@ -350,6 +418,203 @@ export const CanvasPreview: React.FC<CanvasPreviewProps> = ({
     window.addEventListener('pointerup', onUp);
     window.addEventListener('pointercancel', onUp);
   };
+
+  // Interactive Corner Scale Gizmo
+  const handleScaleCornerPointerDown = (e: React.PointerEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+    if (!selectedClipId || !selectedBox) return;
+    const targetClip = clips.find((c) => c.id === selectedClipId);
+    if (!targetClip) return;
+    const track = tracks.find((t) => t.id === targetClip.trackId);
+    if (track?.locked) return;
+
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const centerClientX = rect.left + (selectedBox.centerX / renderWidth) * rect.width;
+    const centerClientY = rect.top + (selectedBox.centerY / renderHeight) * rect.height;
+    const startDist = Math.max(
+      12,
+      Math.hypot(e.clientX - centerClientX, e.clientY - centerClientY)
+    );
+    const origScale = targetClip.scale;
+    let moved = false;
+
+    const onMove = (ev: PointerEvent) => {
+      const currDist = Math.hypot(ev.clientX - centerClientX, ev.clientY - centerClientY);
+      const ratio = currDist / startDist;
+      const nextScale = origScale * ratio;
+      const latest = clips.find((c) => c.id === targetClip.id) || targetClip;
+      const localT = Math.max(0, displayTime - latest.startTime);
+      moved = true;
+      onUpdateClipLive(latest.id, buildScaleGizmoPatch(latest, localT, nextScale));
+    };
+
+    const onUp = () => {
+      if (moved) onCommitHistory();
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
+    };
+
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+  };
+
+  // Interactive Top Rotation Gizmo
+  const handleRotatePointerDown = (e: React.PointerEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+    if (!selectedClipId || !selectedBox) return;
+    const targetClip = clips.find((c) => c.id === selectedClipId);
+    if (!targetClip) return;
+    const track = tracks.find((t) => t.id === targetClip.trackId);
+    if (track?.locked) return;
+
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const centerClientX = rect.left + (selectedBox.centerX / renderWidth) * rect.width;
+    const centerClientY = rect.top + (selectedBox.centerY / renderHeight) * rect.height;
+    const startAngleRad = Math.atan2(e.clientY - centerClientY, e.clientX - centerClientX);
+    const origRotation = targetClip.rotation;
+    let moved = false;
+
+    const onMove = (ev: PointerEvent) => {
+      const currAngleRad = Math.atan2(ev.clientY - centerClientY, ev.clientX - centerClientX);
+      const deltaDeg = ((currAngleRad - startAngleRad) * 180) / Math.PI;
+      const latest = clips.find((c) => c.id === targetClip.id) || targetClip;
+      const localT = Math.max(0, displayTime - latest.startTime);
+      moved = true;
+      onUpdateClipLive(
+        latest.id,
+        buildRotationGizmoPatch(latest, localT, origRotation + deltaDeg, ev.shiftKey)
+      );
+    };
+
+    const onUp = () => {
+      if (moved) onCommitHistory();
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
+    };
+
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+  };
+
+  // Interactive Anchor Point Gizmo
+  const handleAnchorPointerDown = (e: React.PointerEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+    if (!selectedClipId) return;
+    const targetClip = clips.find((c) => c.id === selectedClipId);
+    if (!targetClip) return;
+    const track = tracks.find((t) => t.id === targetClip.trackId);
+    if (track?.locked) return;
+
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const origAnchorX = targetClip.anchorX ?? 0;
+    const origAnchorY = targetClip.anchorY ?? 0;
+    let moved = false;
+
+    const onMove = (ev: PointerEvent) => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const rect = canvas.getBoundingClientRect();
+      const dxPct = ((ev.clientX - startX) / Math.max(1, rect.width)) * 100;
+      const dyPct = ((ev.clientY - startY) / Math.max(1, rect.height)) * 100;
+      let ax = Math.round((origAnchorX + dxPct) * 2) / 2;
+      let ay = Math.round((origAnchorY + dyPct) * 2) / 2;
+      if (!ev.altKey && Math.abs(ax) < 2) ax = 0;
+      if (!ev.altKey && Math.abs(ay) < 2) ay = 0;
+      moved = true;
+      onUpdateClipLive(targetClip.id, {
+        anchorX: Math.max(-100, Math.min(100, ax)),
+        anchorY: Math.max(-100, Math.min(100, ay)),
+      });
+    };
+
+    const onUp = () => {
+      if (moved) onCommitHistory();
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
+    };
+
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+  };
+
+  // Two-finger Pinch-to-Scale & Rotate on Mobile Touchscreens
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    let startDist = 0;
+    let startAngle = 0;
+    let origScale = 100;
+    let origRot = 0;
+    let activeId: string | null = null;
+    let touched = false;
+
+    const onTouchStart = (e: TouchEvent) => {
+      if (e.touches.length !== 2 || !selectedClipId) return;
+      const clip = clips.find((c) => c.id === selectedClipId);
+      if (!clip) return;
+      const track = tracks.find((t) => t.id === clip.trackId);
+      if (track?.locked) return;
+      const dx = e.touches[1].clientX - e.touches[0].clientX;
+      const dy = e.touches[1].clientY - e.touches[0].clientY;
+      startDist = Math.max(10, Math.hypot(dx, dy));
+      startAngle = Math.atan2(dy, dx);
+      origScale = clip.scale;
+      origRot = clip.rotation;
+      activeId = clip.id;
+      touched = false;
+    };
+
+    const onTouchMove = (e: TouchEvent) => {
+      if (e.touches.length !== 2 || !activeId || startDist <= 0) return;
+      e.preventDefault();
+      const dx = e.touches[1].clientX - e.touches[0].clientX;
+      const dy = e.touches[1].clientY - e.touches[0].clientY;
+      const currDist = Math.hypot(dx, dy);
+      const currAngle = Math.atan2(dy, dx);
+      const latest = clips.find((c) => c.id === activeId);
+      if (!latest) return;
+      const localT = Math.max(0, displayTime - latest.startTime);
+      const nextScale = origScale * (currDist / startDist);
+      const nextRot = origRot + ((currAngle - startAngle) * 180) / Math.PI;
+      touched = true;
+      onUpdateClipLive(latest.id, {
+        ...buildScaleGizmoPatch(latest, localT, nextScale),
+        ...buildRotationGizmoPatch(latest, localT, nextRot, false),
+      });
+    };
+
+    const onTouchEnd = () => {
+      if (touched) onCommitHistory();
+      startDist = 0;
+      activeId = null;
+      touched = false;
+    };
+
+    canvas.addEventListener('touchstart', onTouchStart, { passive: true });
+    canvas.addEventListener('touchmove', onTouchMove, { passive: false });
+    canvas.addEventListener('touchend', onTouchEnd);
+    canvas.addEventListener('touchcancel', onTouchEnd);
+    return () => {
+      canvas.removeEventListener('touchstart', onTouchStart);
+      canvas.removeEventListener('touchmove', onTouchMove);
+      canvas.removeEventListener('touchend', onTouchEnd);
+      canvas.removeEventListener('touchcancel', onTouchEnd);
+    };
+  }, [selectedClipId, clips, tracks, displayTime, onUpdateClipLive, onCommitHistory]);
 
   const handleCanvasDoubleClick = () => {
     if (!selectedClipId) return;
@@ -443,6 +708,19 @@ export const CanvasPreview: React.FC<CanvasPreviewProps> = ({
           </button>}
 
           <button
+            onClick={() => setShowScopes((v) => !v)}
+            title="Scopes de Vídeo (Histograma RGB, Waveform IRE, Vectorscope, False Color)"
+            className={`px-2 py-1 rounded flex items-center gap-1 text-[11px] transition-colors cursor-pointer ${
+              showScopes
+                ? 'bg-[#2563eb]/20 text-[#60a5fa] border border-[#2563eb]/40'
+                : 'text-[#71717a] hover:text-[#f4f4f5] hover:bg-[#121215]'
+            }`}
+          >
+            <Activity className="w-3.5 h-3.5" />
+            <span className="hidden sm:inline">Scopes</span>
+          </button>
+
+          <button
             onClick={() => setShowGuides((v) => !v)}
             title="Guias, Grade e Margens de Segurança"
             className={`px-2 py-1 rounded flex items-center gap-1 text-[11px] transition-colors cursor-pointer ${
@@ -470,6 +748,15 @@ export const CanvasPreview: React.FC<CanvasPreviewProps> = ({
         ref={containerRef}
         className={`flex-1 min-h-0 ${isMobile ? 'p-1.5' : 'p-4'} flex items-center justify-center overflow-auto relative`}
       >
+        {showScopes && (
+          <VideoScopesPanel
+            sourceCanvas={canvasRef.current}
+            currentTime={displayTime}
+            falseColor={falseColor}
+            onToggleFalseColor={() => setFalseColor((v) => !v)}
+            onClose={() => setShowScopes(false)}
+          />
+        )}
         <div
           style={{
             width: stageSize.width,
@@ -478,6 +765,7 @@ export const CanvasPreview: React.FC<CanvasPreviewProps> = ({
               ? 'repeating-conic-gradient(#1f1f25 0% 25%, #2b2b34 0% 50%)'
               : undefined,
             backgroundSize: '20px 20px',
+            filter: falseColor ? 'saturate(320%) hue-rotate(140deg) contrast(145%)' : undefined,
           }}
           className="relative shrink-0 shadow-2xl border border-[#27272a] bg-black rounded-md overflow-hidden"
         >
@@ -536,7 +824,25 @@ export const CanvasPreview: React.FC<CanvasPreviewProps> = ({
             ) : null
           )}
 
-          {/* Selection Bounding Box + Anchor Point Overlay */}
+          {/* Magnetic Snapping Alignment Guides */}
+          {(snapGuides.x !== null || snapGuides.y !== null) && (
+            <div className="pointer-events-none absolute inset-0 z-10">
+              {snapGuides.x !== null && (
+                <div
+                  style={{ left: `${snapGuides.x}%` }}
+                  className="absolute top-0 bottom-0 w-px bg-cyan-400 shadow-[0_0_8px_#22d3ee]"
+                />
+              )}
+              {snapGuides.y !== null && (
+                <div
+                  style={{ top: `${snapGuides.y}%` }}
+                  className="absolute left-0 right-0 h-px bg-fuchsia-400 shadow-[0_0_8px_#e879f9]"
+                />
+              )}
+            </div>
+          )}
+
+          {/* Selection Bounding Box + Interactive Scale / Rotate / Anchor Handles */}
           {selectedBox && !isPlaying && (
             <div
               style={{
@@ -551,11 +857,60 @@ export const CanvasPreview: React.FC<CanvasPreviewProps> = ({
                   : 'border-[#3b82f6]'
               }`}
             >
-              <span className="absolute -top-1.5 -left-1.5 w-2.5 h-2.5 bg-white border-2 border-[#2563eb] rounded-xs" />
-              <span className="absolute -top-1.5 -right-1.5 w-2.5 h-2.5 bg-white border-2 border-[#2563eb] rounded-xs" />
-              <span className="absolute -bottom-1.5 -left-1.5 w-2.5 h-2.5 bg-white border-2 border-[#2563eb] rounded-xs" />
-              <span className="absolute -bottom-1.5 -right-1.5 w-2.5 h-2.5 bg-white border-2 border-[#2563eb] rounded-xs" />
-              <Crosshair className="w-3.5 h-3.5 text-amber-400 drop-shadow absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2" />
+              {/* Top Rotation Stem + Handle */}
+              <div className="absolute left-1/2 -top-6 -translate-x-1/2 flex flex-col items-center">
+                <button
+                  type="button"
+                  data-testid="gizmo-rotate-handle"
+                  title="Arrastar para rotacionar camada (Shift = 15°)"
+                  onPointerDown={handleRotatePointerDown}
+                  className="pointer-events-auto touch-none w-4 h-4 rounded-full bg-[#2563eb] hover:bg-[#3b82f6] border border-white text-white flex items-center justify-center shadow cursor-grab active:cursor-grabbing"
+                >
+                  <RotateCw className="w-2.5 h-2.5" />
+                </button>
+                <div className="w-px h-2 bg-[#3b82f6]" />
+              </div>
+
+              {/* 4 Interactive Scale Corner Handles */}
+              <span
+                data-testid="gizmo-scale-nw"
+                title="Arrastar para redimensionar (Escala)"
+                onPointerDown={handleScaleCornerPointerDown}
+                className="pointer-events-auto touch-none absolute -top-2 -left-2 w-3.5 h-3.5 bg-white hover:bg-sky-200 border-2 border-[#2563eb] rounded-xs cursor-nwse-resize shadow"
+              />
+              <span
+                data-testid="gizmo-scale-ne"
+                title="Arrastar para redimensionar (Escala)"
+                onPointerDown={handleScaleCornerPointerDown}
+                className="pointer-events-auto touch-none absolute -top-2 -right-2 w-3.5 h-3.5 bg-white hover:bg-sky-200 border-2 border-[#2563eb] rounded-xs cursor-nesw-resize shadow"
+              />
+              <span
+                data-testid="gizmo-scale-sw"
+                title="Arrastar para redimensionar (Escala)"
+                onPointerDown={handleScaleCornerPointerDown}
+                className="pointer-events-auto touch-none absolute -bottom-2 -left-2 w-3.5 h-3.5 bg-white hover:bg-sky-200 border-2 border-[#2563eb] rounded-xs cursor-nesw-resize shadow"
+              />
+              <span
+                data-testid="gizmo-scale-se"
+                title="Arrastar para redimensionar (Escala)"
+                onPointerDown={handleScaleCornerPointerDown}
+                className="pointer-events-auto touch-none absolute -bottom-2 -right-2 w-3.5 h-3.5 bg-white hover:bg-sky-200 border-2 border-[#2563eb] rounded-xs cursor-nwse-resize shadow"
+              />
+
+              {/* Interactive Anchor Point Handle */}
+              <button
+                type="button"
+                data-testid="gizmo-anchor-handle"
+                title="Arrastar Ponto de Ancoragem (Anchor Point)"
+                onPointerDown={handleAnchorPointerDown}
+                style={{
+                  left: `${50 + (activeSelectedClip?.anchorX ?? 0)}%`,
+                  top: `${50 + (activeSelectedClip?.anchorY ?? 0)}%`,
+                }}
+                className="pointer-events-auto touch-none absolute -translate-x-1/2 -translate-y-1/2 p-0.5 rounded-full hover:bg-amber-400/20 cursor-crosshair"
+              >
+                <Crosshair className="w-4 h-4 text-amber-400 drop-shadow" />
+              </button>
             </div>
           )}
 
@@ -656,6 +1011,13 @@ export const CanvasPreview: React.FC<CanvasPreviewProps> = ({
         </div>
 
         <div className="flex items-center justify-end gap-1.5 shrink-0">
+          <AudioVuMeter
+            project={{ ...project, tracks, clips }}
+            assetsMap={assetsMap}
+            currentTime={displayTime}
+            masterMuted={masterMuted}
+            compact={isMobile}
+          />
           <button
             onClick={onToggleLoop}
             title="Repetição Contínua (Loop)"

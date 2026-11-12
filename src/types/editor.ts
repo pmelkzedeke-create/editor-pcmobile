@@ -142,7 +142,8 @@ export type AnimatableProperty =
   | 'lightDistance'
   | 'dropShadowDistance'
   | 'dropShadowBlur'
-  | 'dropShadowOpacity';
+  | 'dropShadowOpacity'
+  | 'volume';
 
 export type Model3dGeometry =
   | 'cube'
@@ -548,6 +549,9 @@ export interface TimelineClip {
   trackMatte?: TrackMatteMode;
   motionBlur?: boolean;
   labelColor?: string;
+  shy?: boolean; // Camada discreta (oculta na timeline quando Hide Shy está ativo)
+  guideLayer?: boolean; // Camada-guia (visível na prévia, excluída na exportação final)
+  solo?: boolean; // Solo individual de camada
   enabled?: boolean; // Active switch (defaults to true)
   type: ClipType;
   name: string;
@@ -606,6 +610,11 @@ export interface TimelineClip {
   transitionOutDuration: number;
   // Audio
   volume: number; // 0..200 (%)
+  pan?: number; // -100 (L) .. +100 (R)
+  eqLow?: number; // -12..+12 dB
+  eqMid?: number; // -12..+12 dB
+  eqHigh?: number; // -12..+12 dB
+  audioCompressor?: boolean;
   muted: boolean;
   fadeIn: number; // seconds
   fadeOut: number; // seconds

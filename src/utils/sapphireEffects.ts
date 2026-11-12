@@ -112,21 +112,28 @@ function clipToLayer(ctx: CanvasRenderingContext2D, w: number, h: number, draw: 
   return mask.canvas;
 }
 
+let cachedGrainData: ImageData | null = null;
+
 function grainOverlay(ctx: CanvasRenderingContext2D, w: number, h: number, amount: number, size: number, time: number, seed: number) {
   const cell = Math.max(1, Math.round(size * base(w, h) * 1.4));
   const tileW = Math.max(8, Math.round(w / cell));
   const tileH = Math.max(8, Math.round(h / cell));
   const tile = scratch('grain', tileW, tileH);
-  const image = tile.context.createImageData(tileW, tileH);
-  const frame = Math.floor(time * 24);
-  for (let i = 0; i < image.data.length; i += 4) {
-    const value = random(frame * 1.7 + seed + i * 0.37) * 255;
-    image.data[i] = value;
-    image.data[i + 1] = value;
-    image.data[i + 2] = value;
-    image.data[i + 3] = 255;
+  if (!cachedGrainData || cachedGrainData.width !== tileW || cachedGrainData.height !== tileH) {
+    cachedGrainData = tile.context.createImageData(tileW, tileH);
   }
-  tile.context.putImageData(image, 0, 0);
+  const u32 = new Uint32Array(cachedGrainData.data.buffer);
+  const frame = Math.floor(time * 24);
+  let state = ((frame * 2654435761) ^ Math.imul(seed | 1, 1597334677)) >>> 0;
+  if (state === 0) state = 0x6d2b79f5;
+  for (let i = 0; i < u32.length; i++) {
+    state ^= state << 13;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    const v = state & 0xff;
+    u32[i] = 0xff000000 | (v << 16) | (v << 8) | v;
+  }
+  tile.context.putImageData(cachedGrainData, 0, 0);
   ctx.save();
   ctx.globalCompositeOperation = 'overlay';
   ctx.globalAlpha = Math.min(0.85, amount / 100);
@@ -1216,6 +1223,282 @@ export const EFFECT_DEFINITIONS: EffectDefinition[] = [
         extra?.fps ?? 30,
         extra?.duration ?? Infinity
       );
+    },
+  },
+  {
+    type: 'S_RadialBlur',
+    label: 'S_RadialBlur (Zoom & Spin)',
+    category: 'Desfoque',
+    gradient: 'from-cyan-400 via-sky-500 to-blue-700',
+    description: 'Desfoque radial de zoom ou giro centrado em coordenadas ajustáveis.',
+    params: [
+      { key: 'amount', label: 'Intensidade', min: 0, max: 100, step: 1, def: 28, unit: '%' },
+      { key: 'spinDeg', label: 'Rotação (Spin)', min: -45, max: 45, step: 1, def: 0, unit: '°' },
+      { key: 'centerX', label: 'Centro X', min: 0, max: 100, step: 1, def: 50, unit: '%' },
+      { key: 'centerY', label: 'Centro Y', min: 0, max: 100, step: 1, def: 50, unit: '%' },
+      { key: 'samples', label: 'Amostras', min: 4, max: 16, step: 1, def: 8 },
+    ],
+    render: (ctx, w, h, p) => {
+      const amt = (p.amount ?? 28) / 350;
+      const spin = ((p.spinDeg ?? 0) * Math.PI) / 180;
+      if (amt < 0.002 && Math.abs(spin) < 0.002) return;
+      const copy = copyOf(ctx, w, h);
+      const cx = ((p.centerX ?? 50) / 100) * w;
+      const cy = ((p.centerY ?? 50) / 100) * h;
+      const steps = Math.max(4, Math.min(16, Math.round(p.samples ?? 8)));
+      ctx.save();
+      for (let i = 1; i <= steps; i++) {
+        const u = i / steps - 0.5;
+        const scale = 1 + u * amt;
+        const angle = u * spin;
+        ctx.save();
+        ctx.globalAlpha = 1 / (steps + 1);
+        ctx.translate(cx, cy);
+        if (Math.abs(angle) > 0.0005) ctx.rotate(angle);
+        ctx.scale(scale, scale);
+        ctx.translate(-cx, -cy);
+        ctx.drawImage(copy, 0, 0);
+        ctx.restore();
+      }
+      ctx.restore();
+    },
+  },
+  {
+    type: 'S_TurbulentDisplace',
+    label: 'S_TurbulentDisplace',
+    category: 'Distorção',
+    gradient: 'from-violet-400 via-purple-600 to-indigo-800',
+    description: 'Deslocamento turbulento procedural 2D (Turbulent Displace) para calor, água e distorções orgânicas.',
+    params: [
+      { key: 'amount', label: 'Quantidade', min: 0, max: 120, step: 1, def: 24, unit: 'px' },
+      { key: 'size', label: 'Tamanho da Onda', min: 8, max: 200, step: 1, def: 48 },
+      { key: 'evolution', label: 'Velocidade Evolução', min: 0, max: 10, step: 0.2, def: 2 },
+    ],
+    render: (ctx, w, h, p, time) => {
+      const amp = (p.amount ?? 24) * base(w, h);
+      if (amp < 0.5) return;
+      const copy = copyOf(ctx, w, h);
+      const wl = Math.max(8, (p.size ?? 48) * base(w, h));
+      const evo = time * (p.evolution ?? 2);
+      const bands = Math.max(16, Math.min(72, Math.round(h / 8)));
+      const bandH = h / bands;
+      ctx.clearRect(0, 0, w, h);
+      for (let b = 0; b < bands; b++) {
+        const y = b * bandH;
+        const n1 = Math.sin(y / wl + evo * 1.7) * 0.65 + Math.cos(y / (wl * 0.47) - evo * 1.1) * 0.35;
+        const dx = n1 * amp;
+        const dy = Math.cos(y / (wl * 0.8) + evo) * amp * 0.25;
+        ctx.drawImage(copy, 0, y, w, bandH + 1, dx, y + dy, w, bandH + 1);
+      }
+    },
+  },
+  {
+    type: 'S_BulgeTwirl',
+    label: 'S_Bulge & Twirl Lens',
+    category: 'Distorção',
+    gradient: 'from-fuchsia-400 via-pink-600 to-rose-800',
+    description: 'Lente esférica (Bulge/Pinch) e torção radial (Twirl) no centro configurável.',
+    params: [
+      { key: 'bulge', label: 'Bulge / Pinch', min: -100, max: 100, step: 1, def: 35, unit: '%' },
+      { key: 'twirl', label: 'Twirl (Torção)', min: -180, max: 180, step: 1, def: 25, unit: '°' },
+      { key: 'radius', label: 'Raio', min: 10, max: 100, step: 1, def: 45, unit: '%' },
+      { key: 'centerX', label: 'Centro X', min: 0, max: 100, step: 1, def: 50, unit: '%' },
+      { key: 'centerY', label: 'Centro Y', min: 0, max: 100, step: 1, def: 50, unit: '%' },
+    ],
+    render: (ctx, w, h, p) => {
+      const bulge = (p.bulge ?? 35) / 100;
+      const twirlRad = ((p.twirl ?? 25) * Math.PI) / 180;
+      if (Math.abs(bulge) < 0.01 && Math.abs(twirlRad) < 0.01) return;
+      const copy = copyOf(ctx, w, h);
+      const cx = ((p.centerX ?? 50) / 100) * w;
+      const cy = ((p.centerY ?? 50) / 100) * h;
+      const rad = Math.max(16, ((p.radius ?? 45) / 100) * Math.min(w, h));
+      const rings = 10;
+      for (let r = rings; r >= 1; r--) {
+        const u = r / rings;
+        const currR = rad * u;
+        const falloff = 1 - u;
+        const s = Math.max(0.25, 1 + bulge * falloff * 0.65);
+        const rot = twirlRad * falloff;
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(cx, cy, currR, 0, Math.PI * 2);
+        ctx.clip();
+        ctx.translate(cx, cy);
+        ctx.rotate(rot);
+        ctx.scale(s, s);
+        ctx.translate(-cx, -cy);
+        ctx.drawImage(copy, 0, 0);
+        ctx.restore();
+      }
+    },
+  },
+  {
+    type: 'S_CornerPin',
+    label: 'S_CornerPin Perspective',
+    category: 'Distorção',
+    gradient: 'from-teal-400 via-emerald-600 to-green-800',
+    description: 'Deformação de perspectiva 2.5D estilo Corner Pin / Perspective Tilt.',
+    params: [
+      { key: 'tiltX', label: 'Perspectiva Horizontal', min: -50, max: 50, step: 1, def: 15, unit: '%' },
+      { key: 'tiltY', label: 'Perspectiva Vertical', min: -50, max: 50, step: 1, def: 0, unit: '%' },
+      { key: 'shear', label: 'Shear Diagonal', min: -40, max: 40, step: 1, def: 0, unit: '%' },
+    ],
+    render: (ctx, w, h, p) => {
+      const tx = (p.tiltX ?? 15) / 100;
+      const ty = (p.tiltY ?? 0) / 100;
+      const sh = (p.shear ?? 0) / 100;
+      if (Math.abs(tx) < 0.005 && Math.abs(ty) < 0.005 && Math.abs(sh) < 0.005) return;
+      const copy = copyOf(ctx, w, h);
+      const slices = 32;
+      ctx.clearRect(0, 0, w, h);
+      for (let i = 0; i < slices; i++) {
+        const u = i / slices;
+        const v = u - 0.5;
+        const scaleW = Math.max(0.25, 1 + v * ty * 0.9);
+        const sliceW = w * scaleW;
+        const offsetX = (w - sliceW) * 0.5 + v * sh * w * 0.4;
+        const sy = u * h;
+        const shSlice = h / slices + 1;
+        const dy = sy + v * tx * h * 0.15;
+        ctx.drawImage(copy, 0, sy, w, shSlice, offsetX, dy, sliceW, shSlice);
+      }
+    },
+  },
+  {
+    type: 'S_Halation',
+    label: 'S_FilmHalation',
+    category: 'Film',
+    gradient: 'from-orange-400 via-red-500 to-rose-700',
+    description: 'Halação de película 35mm: aura vermelho-alaranjada ao redor das altas luzes.',
+    params: [
+      { key: 'intensity', label: 'Intensidade', min: 0, max: 150, step: 1, def: 65, unit: '%' },
+      { key: 'threshold', label: 'Limiar Altas Luzes', min: 20, max: 95, step: 1, def: 68, unit: '%' },
+      { key: 'spread', label: 'Difusão (Spread)', min: 2, max: 80, step: 1, def: 26, unit: 'px' },
+    ],
+    render: (ctx, w, h, p) => {
+      const hi = highlightPass(ctx.canvas, w, h, p.threshold ?? 68, (p.spread ?? 26) * base(w, h));
+      const warm = scratch('halation-tint', hi.width, hi.height);
+      warm.context.drawImage(hi, 0, 0);
+      warm.context.globalCompositeOperation = 'multiply';
+      warm.context.fillStyle = '#ff471a';
+      warm.context.fillRect(0, 0, hi.width, hi.height);
+      const masked = clipToLayer(ctx, w, h, (c) => {
+        c.drawImage(warm.canvas, 0, 0, w, h);
+      });
+      ctx.save();
+      ctx.globalCompositeOperation = 'screen';
+      ctx.globalAlpha = Math.min(1, (p.intensity ?? 65) / 100);
+      ctx.drawImage(masked, 0, 0);
+      ctx.restore();
+    },
+  },
+  {
+    type: 'S_ThresholdInvert',
+    label: 'S_Threshold & Invert',
+    category: 'Cor',
+    gradient: 'from-zinc-200 via-zinc-500 to-zinc-900',
+    description: 'Limiar alto-contraste (Threshold) e inversão tonal estilizada.',
+    params: [
+      { key: 'threshold', label: 'Limiar (0=Desligado)', min: 0, max: 255, step: 1, def: 128 },
+      { key: 'invert', label: 'Inverter Cores', min: 0, max: 100, step: 1, def: 0, unit: '%' },
+      { key: 'mix', label: 'Mistura', min: 0, max: 100, step: 1, def: 100, unit: '%' },
+    ],
+    render: (ctx, w, h, p) => {
+      const mix = (p.mix ?? 100) / 100;
+      if (mix <= 0.01) return;
+      const copy = copyOf(ctx, w, h);
+      const work = scratch('thresh-work', w, h);
+      const inv = Math.round(p.invert ?? 0);
+      const thr = Math.round(p.threshold ?? 128);
+      work.context.filter = `${inv > 0 ? `invert(${inv}%) ` : ''}${thr > 0 ? `grayscale(100%) contrast(2500%) brightness(${100 + (128 - thr) * 0.6}%)` : ''}`.trim() || 'none';
+      work.context.drawImage(copy, 0, 0);
+      ctx.save();
+      ctx.globalAlpha = mix;
+      ctx.drawImage(work.canvas, 0, 0);
+      ctx.restore();
+    },
+  },
+  {
+    type: 'S_BevelEmboss',
+    label: 'S_Bevel & Emboss',
+    category: 'Estilizar',
+    gradient: 'from-slate-300 via-slate-500 to-slate-800',
+    description: 'Relevo direcional com brilho especular e sombra interna.',
+    params: [
+      { key: 'depth', label: 'Profundidade', min: 1, max: 30, step: 0.5, def: 5, unit: 'px' },
+      { key: 'angle', label: 'Ângulo da Luz', min: 0, max: 360, step: 1, def: 135, unit: '°' },
+      { key: 'strength', label: 'Intensidade', min: 0, max: 100, step: 1, def: 65, unit: '%' },
+    ],
+    render: (ctx, w, h, p) => {
+      const strength = (p.strength ?? 65) / 100;
+      if (strength <= 0.01) return;
+      const rad = ((p.angle ?? 135) * Math.PI) / 180;
+      const dist = (p.depth ?? 5) * base(w, h);
+      const dx = Math.cos(rad) * dist;
+      const dy = Math.sin(rad) * dist;
+      const copy = copyOf(ctx, w, h);
+      const masked = clipToLayer(ctx, w, h, (c) => {
+        c.drawImage(copy, 0, 0);
+        c.globalCompositeOperation = 'screen';
+        c.globalAlpha = strength * 0.55;
+        c.filter = 'brightness(180%) contrast(150%)';
+        c.drawImage(copy, dx, dy);
+        c.globalCompositeOperation = 'multiply';
+        c.globalAlpha = strength * 0.55;
+        c.filter = 'brightness(40%) contrast(150%)';
+        c.drawImage(copy, -dx, -dy);
+      });
+      ctx.clearRect(0, 0, w, h);
+      ctx.drawImage(masked, 0, 0);
+    },
+  },
+  {
+    type: 'S_Particles',
+    label: 'S_ParticleEmitter 2D/3D',
+    category: 'Luz',
+    gradient: 'from-amber-300 via-orange-500 to-purple-700',
+    description: 'Sistema de partículas determinístico com emissor, gravidade, turbulência e profundidade 3D.',
+    params: [
+      { key: 'count', label: 'Partículas', min: 10, max: 250, step: 5, def: 80 },
+      { key: 'speed', label: 'Velocidade', min: 5, max: 200, step: 5, def: 55 },
+      { key: 'gravity', label: 'Gravidade Y', min: -100, max: 100, step: 2, def: -18 },
+      { key: 'turbulence', label: 'Turbulência', min: 0, max: 100, step: 2, def: 30 },
+      { key: 'size', label: 'Tamanho', min: 1, max: 24, step: 0.5, def: 5, unit: 'px' },
+      { key: 'hue', label: 'Matiz (Cor)', min: 0, max: 360, step: 5, def: 38, unit: '°' },
+    ],
+    render: (ctx, w, h, p, time, seed) => {
+      const count = Math.max(5, Math.min(250, Math.round(p.count ?? 80)));
+      const speed = (p.speed ?? 55) / 100;
+      const grav = (p.gravity ?? -18) / 100;
+      const turb = (p.turbulence ?? 30) / 100;
+      const baseSize = (p.size ?? 5) * base(w, h);
+      const hue = p.hue ?? 38;
+      ctx.save();
+      ctx.globalCompositeOperation = 'screen';
+      for (let i = 0; i < count; i++) {
+        const s1 = random(seed + i * 17.3);
+        const s2 = random(seed + i * 31.7);
+        const s3 = random(seed + i * 47.1);
+        const zDepth = 0.35 + s3 * 0.9; // 3D parallax depth
+        const life = (time * speed * (0.5 + s1 * 0.8) + s2) % 1;
+        const startX = s1 * w;
+        const startY = s2 * h;
+        const swayX = Math.sin(time * 2.4 + i * 1.9) * turb * 65 * zDepth;
+        const x = (startX + swayX + w) % w;
+        const y = (startY + life * grav * h * 0.9 * zDepth + h * 2) % h;
+        const radius = Math.max(1, baseSize * zDepth * (1 - Math.abs(life - 0.5) * 1.3));
+        const alpha = Math.sin(life * Math.PI) * 0.85;
+        const grad = ctx.createRadialGradient(x, y, 0, x, y, radius * 2.2);
+        grad.addColorStop(0, `hsla(${hue}, 95%, 80%, ${alpha.toFixed(3)})`);
+        grad.addColorStop(0.5, `hsla(${(hue + 20) % 360}, 90%, 60%, ${(alpha * 0.5).toFixed(3)})`);
+        grad.addColorStop(1, `hsla(${hue}, 90%, 50%, 0)`);
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        ctx.arc(x, y, radius * 2.2, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
     },
   },
 ];

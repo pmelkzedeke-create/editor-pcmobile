@@ -104,4 +104,28 @@ export const EXPRESSION_LIBRARY: ExpressionPreset[] = [
     description: 'Quantiza o movimento em degraus de 10 unidades.',
     exampleTarget: 'rotation, x',
   },
+  {
+    id: 'posterize-stopmotion',
+    name: 'Posterize Time (12 fps)',
+    category: 'Utilidade',
+    code: 'posterizeTime(12, 25)',
+    description: 'Amostra o tempo em 12 quadros/seg para estética spider-verse / stop-motion.',
+    exampleTarget: 'rotation, x, y',
+  },
+  {
+    id: 'conditional-gate',
+    name: 'Condicional (if)',
+    category: 'Utilidade',
+    code: 'if(audioLevel > 0.35, value + 25, value)',
+    description: 'Expressão condicional baseada em comparação (> , < , ==).',
+    exampleTarget: 'scale, opacity',
+  },
+  {
+    id: 'loop-out-cycle',
+    name: 'LoopOut Cíclico',
+    category: 'Movimento',
+    code: 'loopOut(1.5, 45)',
+    description: 'Repete rampa contínua a cada 1.5s.',
+    exampleTarget: 'rotation, x',
+  },
 ];

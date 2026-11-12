@@ -30,6 +30,7 @@ import {
 } from './core/persistence/projectIO';
 import { slicePropertyTracks } from './core/keyframes';
 import { createDefaultMask, createDefaultShapeData } from './core/shapesAndMasks';
+import { buildSubtitleClips, parseSubtitles } from './core/subtitles';
 import { useResponsiveLayout, type MobileDrawer } from './hooks/useResponsiveLayout';
 import { usePreviewRender } from './hooks/usePreviewRender';
 import { useProjectPersistence } from './hooks/useProjectPersistence';
@@ -121,6 +122,26 @@ export function App() {
   const [isLooping, setIsLooping] = useState<boolean>(true);
   const [masterMuted, setMasterMuted] = useState<boolean>(false);
   const [selectedClipId, setSelectedClipId] = useState<string | null>('clip-v1-1');
+  const [selectedClipIds, setSelectedClipIds] = useState<string[]>(['clip-v1-1']);
+
+  const handleSelectClip = useCallback((clipId: string | null, additive = false) => {
+    if (!clipId) {
+      setSelectedClipId(null);
+      setSelectedClipIds([]);
+      return;
+    }
+    if (additive) {
+      setSelectedClipIds((prev) => {
+        const exists = prev.includes(clipId);
+        const next = exists ? prev.filter((id) => id !== clipId) : [...prev, clipId];
+        setSelectedClipId(next.length ? next[next.length - 1] : null);
+        return next;
+      });
+    } else {
+      setSelectedClipId(clipId);
+      setSelectedClipIds([clipId]);
+    }
+  }, []);
   const [activeTab, setActiveTab] = useState<LeftSidebarTab>('media');
   const [zoomPxPerSec, setZoomPxPerSec] = useState<number>(52);
   const [snapEnabled, setSnapEnabled] = useState<boolean>(true);
@@ -147,6 +168,7 @@ export function App() {
 
   // Shared media pool
   const mediaPoolRef = useRef<MediaElementPool>(new MediaElementPool());
+  const copiedClipsRef = useRef<TimelineClip[]>([]);
 
   const showToast = useCallback((msg: string) => {
     setToastMsg(msg);
@@ -437,6 +459,33 @@ export function App() {
 
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
+        const lowerName = file.name.toLowerCase();
+        if (lowerName.endsWith('.srt') || lowerName.endsWith('.vtt')) {
+          const text = await file.text();
+          const cues = parseSubtitles(text);
+          if (cues.length > 0) {
+            applyProjectChange((prev) => {
+              let textTrack = prev.tracks.find((t) => t.type === 'text' && !t.locked);
+              let tracks = prev.tracks;
+              if (!textTrack) {
+                textTrack = {
+                  id: uid('track-t'),
+                  name: 'T • Legendas',
+                  type: 'text',
+                  muted: false,
+                  hidden: false,
+                  locked: false,
+                };
+                tracks = [textTrack, ...prev.tracks];
+              }
+              const subClips = buildSubtitleClips(cues, textTrack.id);
+              return { ...prev, tracks, clips: [...prev.clips, ...subClips] };
+            });
+            setMediaLoading(null);
+            showToast(`${cues.length} legenda(s) importada(s) para a timeline`);
+            return;
+          }
+        }
         if (controller.signal.aborted) {
           cancelled = true;
           break;
@@ -725,21 +774,27 @@ export function App() {
     [applyProjectChange, showToast]
   );
 
-  // Pre-compose Selected Layer
+  // Pre-compose Selected Layer(s)
   const handlePrecomposeSelected = useCallback(() => {
-    if (!selectedClipId) {
-      showToast('Selecione uma camada para pré-compor');
+    const ids = selectedClipIds.length > 0 ? selectedClipIds : selectedClipId ? [selectedClipId] : [];
+    if (ids.length === 0) {
+      showToast('Selecione uma ou mais camadas para pré-compor');
       return;
     }
-    const res = precomposeClips(projectRef.current, [selectedClipId]);
+    const res = precomposeClips(projectRef.current, ids);
     if (!res) {
-      showToast('Não foi possível pré-compor esta camada');
+      showToast('Não foi possível pré-compor esta seleção');
       return;
     }
     applyProjectChange(() => res.nextProject);
     setSelectedClipId(res.precompClipId);
-    showToast('Camada agrupada em Pré-Composição aninhada!');
-  }, [selectedClipId, applyProjectChange, showToast]);
+    setSelectedClipIds([res.precompClipId]);
+    showToast(
+      ids.length > 1
+        ? `${ids.length} camadas agrupadas em Pré-Composição!`
+        : 'Camada agrupada em Pré-Composição aninhada!'
+    );
+  }, [selectedClipId, selectedClipIds, applyProjectChange, showToast]);
 
   // Detect Audio Peaks / Beats and Insert Markers
   const handleDetectAudioBeats = useCallback(
@@ -1308,68 +1363,86 @@ export function App() {
 
   const handleDuplicateClip = useCallback(
     (clipId?: string) => {
-      const id = clipId || selectedClipId;
-      if (!id) return;
+      const ids = clipId ? [clipId] : selectedClipIds.length > 0 ? selectedClipIds : selectedClipId ? [selectedClipId] : [];
+      if (ids.length === 0) return;
 
       applyProjectChange((prev) => {
-        const orig = prev.clips.find((c) => c.id === id);
-        if (!orig) return prev;
-        const copy: TimelineClip = {
-          ...orig,
-          id: uid('clip'),
-          startTime: Number((orig.startTime + orig.duration).toFixed(2)),
-          filters: { ...orig.filters },
-          textStyle: orig.textStyle ? { ...orig.textStyle } : undefined,
-          shapeData: orig.shapeData ? { ...orig.shapeData } : undefined,
-          masks: orig.masks ? orig.masks.map((m) => ({ ...m, id: uid('mask') })) : undefined,
-        };
-        setSelectedClipId(copy.id);
-        showToast('Camada duplicada');
+        const copies: TimelineClip[] = [];
+        for (const id of ids) {
+          const orig = prev.clips.find((c) => c.id === id);
+          if (!orig) continue;
+          copies.push({
+            ...orig,
+            id: uid('clip'),
+            startTime: Number((orig.startTime + orig.duration).toFixed(2)),
+            filters: { ...orig.filters },
+            textStyle: orig.textStyle ? { ...orig.textStyle } : undefined,
+            shapeData: orig.shapeData ? { ...orig.shapeData } : undefined,
+            masks: orig.masks ? orig.masks.map((m) => ({ ...m, id: uid('mask') })) : undefined,
+          });
+        }
+        if (copies.length === 0) return prev;
+        setSelectedClipId(copies[copies.length - 1].id);
+        setSelectedClipIds(copies.map((c) => c.id));
+        showToast(copies.length > 1 ? `${copies.length} camadas duplicadas` : 'Camada duplicada');
         return {
           ...prev,
-          clips: [...prev.clips, copy],
+          clips: [...prev.clips, ...copies],
         };
       });
     },
-    [applyProjectChange, selectedClipId, showToast]
+    [applyProjectChange, selectedClipId, selectedClipIds, showToast]
   );
 
   const handleDeleteClip = useCallback(
     (clipId?: string, ripple = false) => {
-      const id = clipId || selectedClipId;
-      if (!id) return;
+      const ids = clipId ? [clipId] : selectedClipIds.length > 0 ? selectedClipIds : selectedClipId ? [selectedClipId] : [];
+      if (ids.length === 0) return;
 
       applyProjectChange((prev) => {
-        const target = prev.clips.find((c) => c.id === id);
-        if (!target) return prev;
-        const track = prev.tracks.find((t) => t.id === target.trackId);
-        if (track?.locked) {
+        const toDelete = prev.clips.filter((c) => ids.includes(c.id));
+        if (toDelete.length === 0) return prev;
+        const unlockedIds = new Set(
+          toDelete
+            .filter((c) => !prev.tracks.find((t) => t.id === c.trackId)?.locked)
+            .map((c) => c.id)
+        );
+        if (unlockedIds.size === 0) {
           showToast('A faixa está bloqueada');
           return prev;
         }
+        const primary = toDelete[0];
 
         const remaining = prev.clips
-          .filter((c) => c.id !== id)
+          .filter((c) => !unlockedIds.has(c.id))
           .map((c) => {
             if (
               ripple &&
-              c.trackId === target.trackId &&
-              c.startTime >= target.startTime + target.duration - 0.02
+              unlockedIds.size === 1 &&
+              c.trackId === primary.trackId &&
+              c.startTime >= primary.startTime + primary.duration - 0.02
             ) {
               return {
                 ...c,
-                startTime: Math.max(0, Number((c.startTime - target.duration).toFixed(2))),
+                startTime: Math.max(0, Number((c.startTime - primary.duration).toFixed(2))),
               };
             }
             return c;
           });
 
         setSelectedClipId(null);
-        showToast(ripple ? 'Camada excluída e espaço fechado' : 'Camada excluída');
+        setSelectedClipIds([]);
+        showToast(
+          ripple
+            ? 'Camada excluída e espaço fechado'
+            : unlockedIds.size > 1
+            ? `${unlockedIds.size} camadas excluídas`
+            : 'Camada excluída'
+        );
         return { ...prev, clips: remaining };
       });
     },
-    [applyProjectChange, selectedClipId, showToast]
+    [applyProjectChange, selectedClipId, selectedClipIds, showToast]
   );
 
   const handleChangeClipSpeed = useCallback(
@@ -1774,6 +1847,67 @@ export function App() {
       } else if (mod && e.shiftKey && key === 'c') {
         e.preventDefault();
         handlePrecomposeSelected();
+      } else if (mod && !e.shiftKey && key === 'c') {
+        const activeIds =
+          selectedClipIds.length > 0
+            ? selectedClipIds
+            : selectedClipId
+            ? [selectedClipId]
+            : [];
+        if (activeIds.length > 0) {
+          e.preventDefault();
+          copiedClipsRef.current = projectRef.current.clips
+            .filter((c) => activeIds.includes(c.id))
+            .map((c) => JSON.parse(JSON.stringify(c)) as TimelineClip);
+          showToast(`${copiedClipsRef.current.length} camada(s) copiada(s) (Ctrl+C)`);
+        }
+      } else if (mod && !e.shiftKey && key === 'v') {
+        if (copiedClipsRef.current.length > 0) {
+          e.preventDefault();
+          const baseMin = Math.min(...copiedClipsRef.current.map((c) => c.startTime));
+          const playhead = Number(playheadRef.current.toFixed(3));
+          const pastedIds: string[] = [];
+          applyProjectChange((prev) => {
+            const clones = copiedClipsRef.current.map((src) => {
+              const newId = uid('clip');
+              pastedIds.push(newId);
+              return {
+                ...JSON.parse(JSON.stringify(src)),
+                id: newId,
+                name: `${src.name} (Cópia)`,
+                startTime: Number((playhead + (src.startTime - baseMin)).toFixed(3)),
+              } as TimelineClip;
+            });
+            return { ...prev, clips: [...prev.clips, ...clones] };
+          });
+          if (pastedIds.length > 0) {
+            setSelectedClipId(pastedIds[0]);
+            setSelectedClipIds(pastedIds);
+          }
+          showToast(`${pastedIds.length} camada(s) colada(s) na agulha (Ctrl+V)`);
+        }
+      } else if ((key === 'j' || key === 'k') && !mod && !e.shiftKey && !e.altKey) {
+        e.preventDefault();
+        const points = new Set<number>([0]);
+        for (const mk of projectRef.current.markers) points.add(Number(mk.time.toFixed(4)));
+        for (const cl of projectRef.current.clips) {
+          points.add(Number(cl.startTime.toFixed(4)));
+          points.add(Number((cl.startTime + cl.duration).toFixed(4)));
+          for (const tr of cl.keyframes || []) {
+            for (const kf of tr.keyframes) {
+              points.add(Number((cl.startTime + kf.time).toFixed(4)));
+            }
+          }
+        }
+        const sorted = [...points].sort((a, b) => a - b);
+        const now = playheadRef.current;
+        if (key === 'j') {
+          const prevPt = [...sorted].reverse().find((t) => t < now - 0.005);
+          if (prevPt !== undefined) seekTo(prevPt);
+        } else {
+          const nextPt = sorted.find((t) => t > now + 0.005);
+          if (nextPt !== undefined) seekTo(nextPt);
+        }
       } else if (mod && key === 'd') {
         e.preventDefault();
         handleDuplicateClip();
@@ -2021,12 +2155,13 @@ export function App() {
         currentTime={currentTime}
         totalDuration={totalDuration}
         selectedClipId={selectedClipId}
+        selectedClipIds={selectedClipIds}
         zoomPxPerSec={zoomPxPerSec}
         snapEnabled={snapEnabled}
         onChangeZoom={setZoomPxPerSec}
         onToggleSnap={() => setSnapEnabled((s) => !s)}
         onSeek={seekTo}
-        onSelectClip={setSelectedClipId}
+        onSelectClip={handleSelectClip}
         onSplitAtPlayhead={handleSplitAtPlayhead}
         onDuplicateSelected={() => handleDuplicateClip()}
         onDeleteSelected={(ripple) => handleDeleteClip(undefined, ripple)}

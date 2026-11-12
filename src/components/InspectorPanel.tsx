@@ -473,15 +473,31 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
               </button>
             </div>
 
-            <SliderRow
-              label="Volume"
-              value={selectedClip.volume}
-              min={0}
-              max={200}
-              unit="%"
-              onChange={(val) => onUpdateClipLive(selectedClip.id, { volume: val })}
-              onCommit={onCommitHistory}
-            />
+            {(() => {
+              const volKf = keyframeHelper('volume');
+              return (
+                <SliderRow
+                  propKey="volume"
+                  label="Volume"
+                  value={volKf.valNow}
+                  min={0}
+                  max={200}
+                  unit="%"
+                  hasKeyframes={volKf.hasKf}
+                  onAddKeyframe={volKf.toggleKf}
+                  onChange={(val) => volKf.changeVal(val, { volume: val })}
+                  onCommit={onCommitHistory}
+                />
+              );
+            })()}
+            <button
+              type="button"
+              onClick={onOpenPropertyGraph}
+              className="w-full py-1.5 px-2.5 rounded-lg bg-[#18181c] hover:bg-[#27272a] border border-[#27272a] text-[11px] font-medium text-[#60a5fa] flex items-center justify-center gap-1.5 cursor-pointer"
+            >
+              <Spline className="w-3.5 h-3.5" />
+              Curvas de Automação de Volume (Graph Editor)
+            </button>
             <SliderRow
               label="Fade In (Entrada)"
               value={selectedClip.fadeIn}
@@ -502,12 +518,149 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
               onChange={(val) => onUpdateClipLive(selectedClip.id, { fadeOut: val })}
               onCommit={onCommitHistory}
             />
+            <SliderRow
+              label="Balanço Estéreo (Pan L/R)"
+              value={selectedClip.pan ?? 0}
+              min={-100}
+              max={100}
+              unit="%"
+              onChange={(val) => onUpdateClipLive(selectedClip.id, { pan: val })}
+              onCommit={onCommitHistory}
+            />
+            <div className="p-2.5 rounded-lg bg-[#18181c] border border-[#27272a] space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] font-semibold text-[#f4f4f5]">EQ 3-Bandas & Dinâmica</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onUpdateClipLive(selectedClip.id, {
+                      audioCompressor: !selectedClip.audioCompressor,
+                    });
+                    onCommitHistory();
+                  }}
+                  className={`px-2 py-0.5 rounded text-[10px] font-medium border cursor-pointer ${
+                    selectedClip.audioCompressor
+                      ? 'bg-[#2563eb]/20 border-[#2563eb]/50 text-[#60a5fa]'
+                      : 'bg-[#09090b] border-[#27272a] text-[#71717a]'
+                  }`}
+                >
+                  Compressor {selectedClip.audioCompressor ? 'ON' : 'OFF'}
+                </button>
+              </div>
+              <SliderRow
+                label="Graves (Low)"
+                value={selectedClip.eqLow ?? 0}
+                min={-12}
+                max={12}
+                step={0.5}
+                unit="dB"
+                onChange={(val) => onUpdateClipLive(selectedClip.id, { eqLow: val })}
+                onCommit={onCommitHistory}
+              />
+              <SliderRow
+                label="Médios (Mid)"
+                value={selectedClip.eqMid ?? 0}
+                min={-12}
+                max={12}
+                step={0.5}
+                unit="dB"
+                onChange={(val) => onUpdateClipLive(selectedClip.id, { eqMid: val })}
+                onCommit={onCommitHistory}
+              />
+              <SliderRow
+                label="Agudos (High)"
+                value={selectedClip.eqHigh ?? 0}
+                min={-12}
+                max={12}
+                step={0.5}
+                unit="dB"
+                onChange={(val) => onUpdateClipLive(selectedClip.id, { eqHigh: val })}
+                onCommit={onCommitHistory}
+              />
+            </div>
           </div>
         )}
 
         {/* TAB 1: TRANSFORM + COMPOSITING + TEXT LAB */}
         {!isAudio && activeTab === 'main' && (
           <div className="space-y-3">
+            {/* Layer Switches: Solo, Shy, Guide Layer & Label Color */}
+            <div className="p-2 rounded-lg bg-[#18181c] border border-[#27272a] space-y-2">
+              <div className="flex items-center justify-between gap-1">
+                <span className="text-[10px] text-[#a1a1aa] font-medium">Chaves da Camada</span>
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    title="Solo: isola esta camada na composição"
+                    onClick={() => {
+                      onUpdateClipLive(selectedClip.id, { solo: !selectedClip.solo });
+                      onCommitHistory();
+                    }}
+                    className={`px-2 py-0.5 rounded text-[10px] font-semibold border cursor-pointer ${
+                      selectedClip.solo
+                        ? 'bg-amber-500/20 border-amber-400/60 text-amber-300'
+                        : 'bg-[#09090b] border-[#27272a] text-[#71717a]'
+                    }`}
+                  >
+                    Solo
+                  </button>
+                  <button
+                    type="button"
+                    title="Shy: oculta na timeline quando 'Ocultar Shy' está ativo"
+                    onClick={() => {
+                      onUpdateClipLive(selectedClip.id, { shy: !selectedClip.shy });
+                      onCommitHistory();
+                    }}
+                    className={`px-2 py-0.5 rounded text-[10px] font-semibold border cursor-pointer ${
+                      selectedClip.shy
+                        ? 'bg-sky-500/20 border-sky-400/60 text-sky-300'
+                        : 'bg-[#09090b] border-[#27272a] text-[#71717a]'
+                    }`}
+                  >
+                    Shy
+                  </button>
+                  <button
+                    type="button"
+                    title="Camada-Guia: visível na prévia, excluída na exportação final"
+                    onClick={() => {
+                      onUpdateClipLive(selectedClip.id, { guideLayer: !selectedClip.guideLayer });
+                      onCommitHistory();
+                    }}
+                    className={`px-2 py-0.5 rounded text-[10px] font-semibold border cursor-pointer ${
+                      selectedClip.guideLayer
+                        ? 'bg-emerald-500/20 border-emerald-400/60 text-emerald-300'
+                        : 'bg-[#09090b] border-[#27272a] text-[#71717a]'
+                    }`}
+                  >
+                    Guia
+                  </button>
+                </div>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] text-[#71717a]">Cor da Etiqueta</span>
+                <div className="flex items-center gap-1">
+                  {['#3b82f6', '#8b5cf6', '#ec4899', '#ef4444', '#f59e0b', '#10b981', '#06b6d4'].map(
+                    (col) => (
+                      <button
+                        key={col}
+                        type="button"
+                        aria-label={`Cor da camada ${col}`}
+                        onClick={() => {
+                          onUpdateClipLive(selectedClip.id, { labelColor: col });
+                          onCommitHistory();
+                        }}
+                        style={{ backgroundColor: col }}
+                        className={`w-3.5 h-3.5 rounded-full cursor-pointer transition-transform ${
+                          selectedClip.labelColor === col
+                            ? 'ring-2 ring-white scale-110'
+                            : 'opacity-75 hover:opacity-100'
+                        }`}
+                      />
+                    )
+                  )}
+                </div>
+              </div>
+            </div>
             {isSolid && (
               <div className="flex items-center justify-between p-2 rounded-lg bg-[#18181c] border border-[#27272a]">
                 <span className="text-xs text-[#a1a1aa]">Cor do Sólido</span>
@@ -1948,15 +2101,23 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
             {selectedClip.type === 'video' && (
               <>
                 <div className="h-px bg-[#27272a]" />
-                <SliderRow
-                  label="Volume do Vídeo"
-                  value={selectedClip.volume}
-                  min={0}
-                  max={200}
-                  unit="%"
-                  onChange={(val) => onUpdateClipLive(selectedClip.id, { volume: val })}
-                  onCommit={onCommitHistory}
-                />
+                {(() => {
+                  const volKf = keyframeHelper('volume');
+                  return (
+                    <SliderRow
+                      propKey="volume"
+                      label="Volume do Vídeo"
+                      value={volKf.valNow}
+                      min={0}
+                      max={200}
+                      unit="%"
+                      hasKeyframes={volKf.hasKf}
+                      onAddKeyframe={volKf.toggleKf}
+                      onChange={(val) => volKf.changeVal(val, { volume: val })}
+                      onCommit={onCommitHistory}
+                    />
+                  );
+                })()}
               </>
             )}
           </div>

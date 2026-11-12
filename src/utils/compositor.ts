@@ -11,7 +11,7 @@ import { clamp, getClipPlaybackRate, getClipSourceTime } from './timeRemap';
 import { applyEffectChain, type EffectRenderContext } from './sapphireEffects';
 import { sampleProjectAudioLevel } from '../core/audioAnalysis';
 import { getProjectDimensions, resolveWorldTransform } from '../core/compositions';
-import { resolveClipAnimation } from '../core/keyframes';
+import { evaluateClipVolume, resolveClipAnimation } from '../core/keyframes';
 import { SourceEffectsProcessor } from '../core/vision/sourceEffects';
 import {
   applyLayerMasksToCanvas,
@@ -68,6 +68,8 @@ export interface RenderCompositionOptions {
   audioLevel?: number;
   /** Substitui o drawable de um clipe de vídeo por quadro interpolado (fluxo óptico). */
   frameOverride?: Map<string, CanvasImageSource>;
+  /** Quando true, camadas marcadas como guideLayer são omitidas na exportação final. */
+  isExport?: boolean;
 }
 
 export class MediaElementPool {
@@ -130,7 +132,11 @@ export class MediaElementPool {
     };
   }
 
-  private notify = () => this.listeners.forEach((fn) => fn());
+  suppressNotify = 0;
+  private notify = () => {
+    if (this.suppressNotify > 0) return;
+    this.listeners.forEach((fn) => fn());
+  };
 
   getImage(url: string): HTMLImageElement {
     let img = this.images.get(url);
@@ -321,10 +327,11 @@ export function syncMediaPlayback(
     const forward = rate >= 0.0625 && rate <= 16;
     const fadeIn = clip.fadeIn > 0 ? Math.min(1, localTime / clip.fadeIn) : 1;
     const fadeOut = clip.fadeOut > 0 ? Math.min(1, (clip.duration - localTime) / clip.fadeOut) : 1;
+    const dynVolume = evaluateClipVolume(clip, localTime);
     const volume =
       !forward || track.muted || clip.muted
         ? 0
-        : clamp(((clip.volume / 100) * fadeIn * fadeOut), 0, 1);
+        : clamp(((dynVolume / 100) * fadeIn * fadeOut), 0, 1);
     element.volume = volume;
     element.muted = volume === 0;
     if (cachedVisual && clip.type === 'video' && volume === 0) {
@@ -749,7 +756,7 @@ function renderSingleVisualClip(
       centerX,
       centerY,
     };
-  } else if (clip.type === 'precomp' && clip.precompId && (options?.depth || 0) < 4) {
+  } else if (clip.type === 'precomp' && clip.precompId && (options?.depth || 0) < 12) {
     const subComp = options?.compositions?.find((c) => c.id === clip.precompId);
     if (subComp) {
       const subDepth = (options?.depth || 0) + 1;
@@ -769,6 +776,7 @@ function renderSingleVisualClip(
           fps: subComp.fps,
           compositions: options?.compositions,
           depth: subDepth,
+          isExport: options?.isExport,
         }
       );
 
@@ -805,13 +813,24 @@ function renderSingleVisualClip(
           srcH = (overridden as HTMLCanvasElement).height || srcH;
         } else {
         const vid = pool.getVideo(clip.id, asset.url);
-        if (vid.readyState >= 2) {
+        if (vid.readyState >= 2 && !vid.seeking) {
           drawable = vid;
           srcW = vid.videoWidth || srcW;
           srcH = vid.videoHeight || srcH;
-        } else if (asset.thumbnail) {
-          const thumb = pool.getImage(asset.thumbnail);
-          if (thumb.complete && thumb.naturalWidth > 0) drawable = thumb;
+        } else {
+          const cachedSample = pool.getTemporalSample(clip.id, sourceTime) as HTMLCanvasElement | null;
+          if (cachedSample) {
+            drawable = cachedSample as unknown as HTMLVideoElement;
+            srcW = cachedSample.width || srcW;
+            srcH = cachedSample.height || srcH;
+          } else if (vid.readyState >= 2) {
+            drawable = vid;
+            srcW = vid.videoWidth || srcW;
+            srcH = vid.videoHeight || srcH;
+          } else if (asset.thumbnail) {
+            const thumb = pool.getImage(asset.thumbnail);
+            if (thumb.complete && thumb.naturalWidth > 0) drawable = thumb;
+          }
         }
         }
       } else {
@@ -1399,8 +1418,10 @@ export function renderFrameToCanvas(
   const allClipsMap = new Map(clips.map((c) => [c.id, c]));
 
   // Tracks at bottom of list are background layers; top of list are foreground layers
+  const hasSoloTrack = tracks.some((t) => t.solo && !t.hidden && t.type !== 'audio');
+  const hasSoloClip = clips.some((c) => c.solo && c.enabled !== false);
   const visualTracksBottomUp = [...tracks]
-    .filter((t) => !t.hidden && t.type !== 'audio')
+    .filter((t) => !t.hidden && t.type !== 'audio' && (!hasSoloTrack || t.solo))
     .reverse();
 
   const consumedMatteIds = new Set<string>();
@@ -1413,6 +1434,8 @@ export function renderFrameToCanvas(
       .filter(
         (c) =>
           c.enabled !== false &&
+          (!options?.isExport || !c.guideLayer) &&
+          (!hasSoloClip || c.solo) &&
           c.trackId === track.id &&
           currentTime >= c.startTime &&
           currentTime < c.startTime + c.duration
@@ -1510,10 +1533,14 @@ export interface VideoExportOptions {
   range?: WorkArea;
   fpsOverride?: 24 | 30 | 60 | 120;
   bitrateMbps?: number;
+  /** Formato de contêiner preferido: 'mp4' (H.264) ou 'webm' (VP8/VP9) */
+  container?: 'mp4' | 'webm';
   /** Suavização de clipes de baixa taxa: 'off' | 'flow' (fluxo óptico) | 'blend' */
   smoothing?: 'off' | 'flow' | 'blend';
   /** Motion blur por amostragem temporal: 0 (off), 2 ou 4 subamostras por quadro. */
   motionBlurSamples?: number;
+  /** Permite pausar e retomar a renderização quadro a quadro */
+  waitIfPaused?: () => Promise<void>;
 }
 
 /**

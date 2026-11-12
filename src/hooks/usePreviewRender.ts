@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { MediaAsset, PreviewResolution, ProjectState, WorkArea } from '../types/editor';
 import { getProjectDimensions } from '../core/compositions';
 import { AutoPreviewRenderer } from '../core/autoPreview';
+import { MediaElementPool } from '../utils/compositor';
 import { PreviewFrameCache, renderPreviewRange } from '../utils/previewCache';
 
 export interface PreviewRenderState {
@@ -24,6 +25,18 @@ interface AutoPreviewOptions {
 export function usePreviewRender(project: ProjectState, assets: Map<string, MediaAsset>, resolution: PreviewResolution, auto?: AutoPreviewOptions) {
   const [autoEnabled, setAutoEnabled] = useState(true);
   const [autoBusy, setAutoBusy] = useState(false);
+  const sharedPoolRef = useRef<MediaElementPool | null>(null);
+  if (!sharedPoolRef.current) {
+    sharedPoolRef.current = new MediaElementPool();
+  }
+
+  useEffect(() => {
+    return () => {
+      sharedPoolRef.current?.dispose();
+      sharedPoolRef.current = null;
+    };
+  }, []);
+
   // Nested comps and audio-reactive inputs affect pixels; the playhead never does.
   const signature = useMemo(() => JSON.stringify({
     ratio: project.aspectRatio, cw: project.customWidth, ch: project.customHeight,
@@ -63,19 +76,32 @@ export function usePreviewRender(project: ProjectState, assets: Map<string, Medi
 
   useEffect(() => {
     if (!autoEnabled || auto?.suspended || manualRef.current) return;
-    const renderer = new AutoPreviewRenderer(effectiveProject, assets, cache, (busy, error) => {
-      setAutoBusy(busy);
-      if (manualRef.current) return;
-      if (busy && !error && performance.now() - lastAutomaticPublish.current < 100) return;
-      lastAutomaticPublish.current = performance.now();
-      setState((previous) => ({
-        ...previous, status: error ? 'error' : cache.frames.size ? 'ready' : 'idle',
-        frameCount: cache.frames.size, bytes: cache.bytes, ranges: cache.ranges(),
-        error: error || null, automatic: true,
-      }));
-    });
+    const renderer = new AutoPreviewRenderer(
+      effectiveProject,
+      assets,
+      cache,
+      (busy, error) => {
+        setAutoBusy(busy);
+        if (manualRef.current) return;
+        if (busy && !error && performance.now() - lastAutomaticPublish.current < 80) return;
+        lastAutomaticPublish.current = performance.now();
+        setState((previous) => ({
+          ...previous,
+          status: error ? 'error' : cache.frames.size ? 'ready' : 'idle',
+          frameCount: cache.frames.size,
+          bytes: cache.bytes,
+          ranges: cache.ranges(),
+          error: error || null,
+          automatic: true,
+        }));
+      },
+      sharedPoolRef.current || undefined
+    );
     automaticRef.current = renderer;
-    return () => { renderer.dispose(); if (automaticRef.current === renderer) automaticRef.current = null; };
+    return () => {
+      renderer.dispose();
+      if (automaticRef.current === renderer) automaticRef.current = null;
+    };
   }, [effectiveProject, assets, cache, autoEnabled, auto?.suspended, schedulerVersion]);
 
   useEffect(() => {

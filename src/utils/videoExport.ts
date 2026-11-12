@@ -1,10 +1,15 @@
 import { ArrayBufferTarget, Muxer } from 'webm-muxer';
+import {
+  ArrayBufferTarget as Mp4ArrayBufferTarget,
+  Muxer as Mp4Muxer,
+} from 'mp4-muxer';
 import type { ExportQuality, MediaAsset, ProjectState, WorkArea } from '../types/editor';
 import { MediaElementPool, renderFrameToCanvas } from './compositor';
 import type { VideoExportOptions } from './compositor';
 import { checkAborted, prepareMediaFrame, seekVideoFrame } from './previewCache';
 import { clamp, getClipPlaybackRate, getClipSourceTime } from './timeRemap';
 import { getProjectDimensions } from '../core/compositions';
+import { evaluateClipVolume } from '../core/keyframes';
 import { setWebmDuration } from './webmDuration';
 
 export async function mixProjectAudio(
@@ -24,7 +29,7 @@ export async function mixProjectAudio(
       !track.muted &&
       !(clip.type === 'video' && track.hidden) &&
       !clip.muted &&
-      clip.volume > 0
+      (clip.volume > 0 || clip.keyframes?.some((k) => k.property === 'volume'))
     );
   });
   if (!clips.length) return null;
@@ -75,21 +80,37 @@ export async function mixProjectAudio(
         if (rate < 0.0625 || rate > 16) continue;
         const sourceStart = getClipSourceTime(clip, local) * source.sampleRate;
         const sourceEnd = getClipSourceTime(clip, local + count / sampleRate) * source.sampleRate;
+        const panNorm = clamp((clip.pan ?? 0) / 100, -1, 1);
+        const panGainL = panNorm <= 0 ? 1 : 1 - panNorm;
+        const panGainR = panNorm >= 0 ? 1 : 1 + panNorm;
+        const eqAvgDb = ((clip.eqLow ?? 0) + (clip.eqMid ?? 0) + (clip.eqHigh ?? 0)) / 3;
+        const eqGain = Math.pow(10, eqAvgDb / 20);
         for (let channel = 0; channel < 2; channel++) {
           const data = source.getChannelData(Math.min(channel, source.numberOfChannels - 1));
           const target = output.getChannelData(channel);
+          const chGain = (channel === 0 ? panGainL : panGainR) * eqGain;
           for (let i = 0; i < count; i++) {
             const position = sourceStart + ((sourceEnd - sourceStart) * i) / count;
             if (position < 0 || position >= data.length - 1) continue;
             const floor = Math.floor(position);
             const fraction = position - floor;
             const t = local + i / sampleRate;
+            const dynVol = evaluateClipVolume(clip, t);
             const fadeIn = clip.fadeIn > 0 ? clamp(t / clip.fadeIn, 0, 1) : 1;
             const fadeOut = clip.fadeOut > 0 ? clamp((clip.duration - t) / clip.fadeOut, 0, 1) : 1;
-            target[start + i] +=
-              (((data[floor] * (1 - fraction) + data[floor + 1] * fraction) * clip.volume) / 100) *
+            let s =
+              (((data[floor] * (1 - fraction) + data[floor + 1] * fraction) * dynVol) / 100) *
               fadeIn *
-              fadeOut;
+              fadeOut *
+              chGain;
+            if (clip.audioCompressor) {
+              // Soft-knee compressor/limiter (threshold 0.55, ratio 3:1)
+              const absS = Math.abs(s);
+              if (absS > 0.55) {
+                s = Math.sign(s) * (0.55 + (absS - 0.55) / 3);
+              }
+            }
+            target[start + i] += s;
           }
         }
         if ((start - first) % (sampleRate * 2) < 64) {
@@ -172,7 +193,9 @@ export async function exportPngSequenceArchive(
   quality: ExportQuality,
   onProgress: (percent: number, time: number) => void,
   signal: AbortSignal,
-  range?: WorkArea
+  range?: WorkArea,
+  imageFormat: 'png' | 'jpeg' | 'webp' = 'png',
+  waitIfPaused?: () => Promise<void>
 ): Promise<{ blob: Blob; filename: string; frameCount: number }> {
   const spec = getProjectDimensions(project);
   const targetShort = quality === '4k' ? 2160 : quality === '2k' ? 1440 : quality === '1080p' ? 1080 : 720;
@@ -185,7 +208,7 @@ export async function exportPngSequenceArchive(
   const rStart = range ? Math.max(0, range.start) : 0;
   const rEnd = range ? Math.min(fullDur, range.end) : fullDur;
   const span = Math.max(1 / project.fps, rEnd - rStart);
-  const frameCount = Math.max(1, Math.min(300, Math.ceil(span * project.fps)));
+  const frameCount = Math.max(1, Math.ceil(span * project.fps));
 
   const pool = new MediaElementPool();
   const canvas = document.createElement('canvas');
@@ -213,23 +236,37 @@ export async function exportPngSequenceArchive(
     return header;
   };
 
+  const mime =
+    imageFormat === 'jpeg'
+      ? 'image/jpeg'
+      : imageFormat === 'webp'
+      ? 'image/webp'
+      : 'image/png';
+  const ext = imageFormat === 'jpeg' ? 'jpg' : imageFormat;
+
   try {
     await document.fonts.ready;
     for (let i = 0; i < frameCount; i++) {
+      if (waitIfPaused) await waitIfPaused();
       checkAborted(signal);
       const time = rStart + i / project.fps;
       await prepareMediaFrame(project, assetsMap, pool, time, signal);
       renderFrameToCanvas(ctx, width, height, project.tracks, project.clips, assetsMap, pool, time, {
         backgroundColor: project.backgroundColor,
-        transparentBg: project.transparentBg,
+        transparentBg: imageFormat === 'jpeg' ? false : project.transparentBg,
         fps: project.fps,
         compositions: project.compositions,
+        isExport: true,
       });
-      const pngBlob = await new Promise<Blob>((res, rej) =>
-        canvas.toBlob((b) => (b ? res(b) : rej(new Error('Falha ao codificar PNG'))), 'image/png')
+      const imgBlob = await new Promise<Blob>((res, rej) =>
+        canvas.toBlob(
+          (b) => (b ? res(b) : rej(new Error(`Falha ao codificar ${ext.toUpperCase()}`))),
+          mime,
+          0.92
+        )
       );
-      const bytes = new Uint8Array(await pngBlob.arrayBuffer());
-      const name = `frame-${String(i + 1).padStart(4, '0')}.png`;
+      const bytes = new Uint8Array(await imgBlob.arrayBuffer());
+      const name = `frame-${String(i + 1).padStart(4, '0')}.${ext}`;
       tarParts.push(makeTarHeader(name, bytes.length));
       tarParts.push(bytes);
       const pad = (512 - (bytes.length % 512)) % 512;
@@ -240,7 +277,7 @@ export async function exportPngSequenceArchive(
     const safeName = project.projectName.trim().toLowerCase().replace(/[^a-z0-9-_]+/gi, '-') || 'sequencia';
     return {
       blob: new Blob(tarParts as BlobPart[], { type: 'application/x-tar' }),
-      filename: `${safeName}-png-seq.tar`,
+      filename: `${safeName}-${ext}-seq.tar`,
       frameCount,
     };
   } finally {
@@ -263,22 +300,75 @@ export async function exportWithWebCodecs(
   const width = Math.round((spec.width * factor) / 2) * 2;
   const height = Math.round((spec.height * factor) / 2) * 2;
   const defaultMbps = quality === '4k' ? 22 : quality === '2k' ? 14 : quality === '1080p' ? 8 : 5;
-  const videoConfig: VideoEncoderConfig = {
+  const bitrate = (exportOpts?.bitrateMbps || defaultMbps) * 1_000_000;
+
+  let useMp4 = exportOpts?.container === 'mp4' && !project.transparentBg;
+  let videoConfig: VideoEncoderConfig = {
     codec: 'vp8',
     width,
     height,
     framerate: project.fps,
-    bitrate: (exportOpts?.bitrateMbps || defaultMbps) * 1_000_000,
+    bitrate,
   };
-  const audioConfig: AudioEncoderConfig = {
+  let audioConfig: AudioEncoderConfig = {
     codec: 'opus',
     sampleRate: 48000,
     numberOfChannels: 2,
     bitrate: 128000,
   };
+  let mp4AudioCodec: 'aac' | 'opus' = 'aac';
+
+  if (useMp4) {
+    const h264Candidates = ['avc1.640028', 'avc1.4d002a', 'avc1.420028', 'avc1.42001f'];
+    let pickedH264: string | null = null;
+    for (const c of h264Candidates) {
+      const check = await VideoEncoder.isConfigSupported({
+        codec: c,
+        width,
+        height,
+        framerate: project.fps,
+        bitrate,
+      });
+      if (check.supported) {
+        pickedH264 = c;
+        break;
+      }
+    }
+    const aacCheck = await AudioEncoder.isConfigSupported({
+      codec: 'mp4a.40.2',
+      sampleRate: 48000,
+      numberOfChannels: 2,
+      bitrate: 128000,
+    });
+    const opusCheck = await AudioEncoder.isConfigSupported(audioConfig);
+    if (pickedH264 && (aacCheck.supported || opusCheck.supported)) {
+      videoConfig = {
+        codec: pickedH264,
+        width,
+        height,
+        framerate: project.fps,
+        bitrate,
+      };
+      if (aacCheck.supported) {
+        audioConfig = {
+          codec: 'mp4a.40.2',
+          sampleRate: 48000,
+          numberOfChannels: 2,
+          bitrate: 128000,
+        };
+        mp4AudioCodec = 'aac';
+      } else {
+        mp4AudioCodec = 'opus';
+      }
+    } else {
+      useMp4 = false;
+    }
+  }
+
   if (
-    !(await VideoEncoder.isConfigSupported(videoConfig)).supported ||
-    !(await AudioEncoder.isConfigSupported(audioConfig)).supported
+    !useMp4 &&
+    (!(await VideoEncoder.isConfigSupported(videoConfig)).supported ||
+      !(await AudioEncoder.isConfigSupported(audioConfig)).supported)
   ) {
     return null;
   }
@@ -291,23 +381,46 @@ export async function exportWithWebCodecs(
 
   onProgress(0, rangeStart);
   const audio = await mixProjectAudio(project, assetsMap, rangeStart, duration, signal);
-  const target = new ArrayBufferTarget();
-  const muxer = new Muxer({
-    target,
-    video: { codec: 'V_VP8', width, height, frameRate: project.fps },
-    ...(audio ? { audio: { codec: 'A_OPUS', sampleRate: 48000, numberOfChannels: 2 } } : {}),
-    firstTimestampBehavior: 'offset',
-  });
+
+  const webmTarget = useMp4 ? null : new ArrayBufferTarget();
+  const webmMuxer = useMp4
+    ? null
+    : new Muxer({
+        target: webmTarget!,
+        video: { codec: 'V_VP8', width, height, frameRate: project.fps },
+        ...(audio ? { audio: { codec: 'A_OPUS', sampleRate: 48000, numberOfChannels: 2 } } : {}),
+        firstTimestampBehavior: 'offset',
+      });
+
+  const mp4Target = useMp4 ? new Mp4ArrayBufferTarget() : null;
+  const mp4Muxer = useMp4
+    ? new Mp4Muxer({
+        target: mp4Target!,
+        video: { codec: 'avc', width, height, frameRate: project.fps },
+        ...(audio
+          ? { audio: { codec: mp4AudioCodec, sampleRate: 48000, numberOfChannels: 2 } }
+          : {}),
+        fastStart: 'in-memory',
+        firstTimestampBehavior: 'offset',
+      })
+    : null;
+
   let encoderError: Error | null = null;
   const videoEncoder = new VideoEncoder({
-    output: (chunk, metadata) => muxer.addVideoChunk(chunk, metadata),
+    output: (chunk, metadata) => {
+      if (mp4Muxer) mp4Muxer.addVideoChunk(chunk, metadata);
+      else webmMuxer?.addVideoChunk(chunk, metadata);
+    },
     error: (error) => {
       encoderError = error;
     },
   });
   const audioEncoder = audio
     ? new AudioEncoder({
-        output: (chunk, metadata) => muxer.addAudioChunk(chunk, metadata),
+        output: (chunk, metadata) => {
+          if (mp4Muxer) mp4Muxer.addAudioChunk(chunk, metadata);
+          else webmMuxer?.addAudioChunk(chunk, metadata);
+        },
         error: (error) => {
           encoderError = error;
         },
@@ -364,6 +477,7 @@ export async function exportWithWebCodecs(
     await document.fonts.ready;
     const frameCount = Math.ceil(duration * project.fps);
     for (let index = 0; index < frameCount; index++) {
+      if (exportOpts?.waitIfPaused) await exportOpts.waitIfPaused();
       checkAborted(signal);
       if (encoderError) throw encoderError;
       const localExportTime = index / project.fps;
@@ -417,6 +531,7 @@ export async function exportWithWebCodecs(
               fps: project.fps,
               compositions: project.compositions,
               frameOverride,
+              isExport: true,
             }
           );
           accumCtx.globalAlpha = 1 / subSamples;
@@ -443,6 +558,7 @@ export async function exportWithWebCodecs(
             fps: project.fps,
             compositions: project.compositions,
             frameOverride,
+            isExport: true,
           }
         );
       }
@@ -485,12 +601,21 @@ export async function exportWithWebCodecs(
     await audioEncoder?.flush();
     checkAborted(signal);
     if (encoderError) throw encoderError;
-    muxer.finalize();
-    if (!setWebmDuration(target.buffer, duration)) throw new Error('Falha ao finalizar a duracao do WebM.');
-    onProgress(100, rangeEnd);
     const name = project.projectName.trim().toLowerCase().replace(/[^a-z0-9-_]+/gi, '-') || 'meu-video';
+    if (mp4Muxer && mp4Target) {
+      mp4Muxer.finalize();
+      onProgress(100, rangeEnd);
+      return {
+        blob: new Blob([mp4Target.buffer], { type: 'video/mp4' }),
+        filename: `${name}-${quality}.mp4`,
+        mimeType: 'video/mp4',
+      };
+    }
+    webmMuxer!.finalize();
+    if (!setWebmDuration(webmTarget!.buffer, duration)) throw new Error('Falha ao finalizar a duracao do WebM.');
+    onProgress(100, rangeEnd);
     return {
-      blob: new Blob([target.buffer], { type: 'video/webm' }),
+      blob: new Blob([webmTarget!.buffer], { type: 'video/webm' }),
       filename: `${name}-${quality}.webm`,
       mimeType: 'video/webm',
     };

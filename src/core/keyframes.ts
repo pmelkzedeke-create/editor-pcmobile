@@ -49,6 +49,7 @@ export const ANIMATABLE_PROPERTIES: AnimatablePropertyMeta[] = [
   { key: 'dropShadowDistance', label: 'Distância Sombra', unit: 'px', min: 0, max: 100, step: 1, group: 'transform' },
   { key: 'dropShadowBlur', label: 'Desfoque Sombra', unit: 'px', min: 0, max: 100, step: 1, group: 'transform' },
   { key: 'dropShadowOpacity', label: 'Opacidade Sombra', unit: '%', min: 0, max: 100, step: 1, group: 'transform' },
+  { key: 'volume', label: 'Volume de Áudio', unit: '%', min: 0, max: 200, step: 1, group: 'transform' },
 ];
 
 export const ANIMATABLE_PROP_MAP = new Map(ANIMATABLE_PROPERTIES.map((p) => [p.key, p]));
@@ -117,6 +118,8 @@ export function getClipBasePropertyValue(clip: TimelineClip, prop: AnimatablePro
       return clip.dropShadow?.blur ?? 12;
     case 'dropShadowOpacity':
       return clip.dropShadow?.opacity ?? 60;
+    case 'volume':
+      return clip.volume ?? 100;
   }
 }
 
@@ -186,6 +189,8 @@ export function applyBasePropertyPatch(clip: TimelineClip, prop: AnimatablePrope
       return clip.dropShadow ? { dropShadow: { ...clip.dropShadow, blur: val } } : {};
     case 'dropShadowOpacity':
       return clip.dropShadow ? { dropShadow: { ...clip.dropShadow, opacity: val } } : {};
+    case 'volume':
+      return { volume: Math.max(0, Math.min(200, val)) };
   }
 }
 
@@ -286,6 +291,13 @@ export interface ResolvedClipAnimation {
   dropShadowDistance: number;
   dropShadowBlur: number;
   dropShadowOpacity: number;
+  volume: number;
+}
+
+export function evaluateClipVolume(clip: TimelineClip, localTime: number): number {
+  const track = clip.keyframes?.find((t) => t.property === 'volume');
+  const raw = evaluatePropertyTrack(track, localTime, clip.volume ?? 100);
+  return Math.max(0, Math.min(200, raw));
 }
 
 function hashSeed(id: string): number {
@@ -387,6 +399,7 @@ export function resolveClipAnimation(
     dropShadowDistance: Math.max(0, evalProp('dropShadowDistance')),
     dropShadowBlur: Math.max(0, evalProp('dropShadowBlur')),
     dropShadowOpacity: Math.max(0, Math.min(100, evalProp('dropShadowOpacity'))),
+    volume: Math.max(0, Math.min(200, evalProp('volume'))),
   };
 }
 

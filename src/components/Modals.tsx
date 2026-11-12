@@ -3,11 +3,14 @@ import {
   Camera,
   CheckCircle2,
   Download,
+  FileText,
   Film,
   Images,
   Keyboard,
   Loader2,
   Music,
+  Pause,
+  Play,
   X,
 } from 'lucide-react';
 import {
@@ -17,6 +20,7 @@ import {
   WorkArea,
 } from '../types/editor';
 import { getProjectDimensions } from '../core/compositions';
+import { serializeClipsToSubtitles } from '../core/subtitles';
 import { exportProjectToVideoFile } from '../utils/compositor';
 import { formatTimecode } from '../utils/mediaHelpers';
 import { exportAudioWavFile, exportPngSequenceArchive } from '../utils/videoExport';
@@ -39,12 +43,19 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   onClose,
 }) => {
   const [quality, setQuality] = useState<ExportQuality>('1080p');
+  const [container, setContainer] = useState<'webm' | 'mp4'>('webm');
   const [rangeMode, setRangeMode] = useState<'full' | 'workArea'>('full');
   const [bitrateMbps, setBitrateMbps] = useState<number>(8);
   const [fpsOverride, setFpsOverride] = useState<'' | 24 | 30 | 60 | 120>('');
   const [smoothing, setSmoothing] = useState<'off' | 'flow' | 'blend'>('flow');
   const [motionBlurSamples, setMotionBlurSamples] = useState<number>(0);
+  const [seqFormat, setSeqFormat] = useState<'png' | 'webp' | 'jpeg'>('png');
   const [status, setStatus] = useState<'idle' | 'rendering' | 'done' | 'error'>('idle');
+  const [isPaused, setIsPaused] = useState(false);
+  const pausedRef = useRef(false);
+  const renderStartWallRef = useRef(0);
+  const [renderSpeedFps, setRenderSpeedFps] = useState(0);
+  const [etaSec, setEtaSec] = useState<number | null>(null);
   const [progress, setProgress] = useState(0);
   const [renderedTime, setRenderedTime] = useState(0);
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
@@ -103,8 +114,30 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     a.click();
   };
 
+  const waitIfPaused = async () => {
+    while (pausedRef.current && !abortRef.current?.signal.aborted) {
+      await new Promise((r) => setTimeout(r, 80));
+    }
+  };
+
+  const updateProgressMetrics = (pct: number, t: number) => {
+    setProgress(pct);
+    setRenderedTime(t);
+    const elapsedSec = Math.max(0.05, (performance.now() - renderStartWallRef.current) / 1000);
+    const activeFps = fpsOverride || project.fps;
+    const totalFrames = Math.max(1, Math.ceil(targetDuration * activeFps));
+    const doneFrames = Math.max(1, Math.round((pct / 100) * totalFrames));
+    const fpsNow = Number((doneFrames / elapsedSec).toFixed(1));
+    setRenderSpeedFps(fpsNow);
+    const remainingFrames = Math.max(0, totalFrames - doneFrames);
+    setEtaSec(fpsNow > 0.2 ? Math.ceil(remainingFrames / fpsNow) : null);
+  };
+
   const startExport = async () => {
     setStatus('rendering');
+    setIsPaused(false);
+    pausedRef.current = false;
+    renderStartWallRef.current = performance.now();
     setProgress(0);
     setErrorMsg('');
     const controller = new AbortController();
@@ -115,12 +148,17 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         project,
         assets,
         quality,
-        (pct, t) => {
-          setProgress(pct);
-          setRenderedTime(t);
-        },
+        updateProgressMetrics,
         controller.signal,
-        { range: activeRange, bitrateMbps, fpsOverride: fpsOverride || undefined, smoothing, motionBlurSamples }
+        {
+          range: activeRange,
+          bitrateMbps,
+          fpsOverride: fpsOverride || undefined,
+          container,
+          smoothing,
+          motionBlurSamples,
+          waitIfPaused,
+        }
       );
       triggerDownload(result.blob, result.filename, 'video');
     } catch (err) {
@@ -137,6 +175,9 @@ export const ExportModal: React.FC<ExportModalProps> = ({
 
   const startPngSequenceExport = async () => {
     setStatus('rendering');
+    setIsPaused(false);
+    pausedRef.current = false;
+    renderStartWallRef.current = performance.now();
     setProgress(0);
     setErrorMsg('');
     const controller = new AbortController();
@@ -146,22 +187,31 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         project,
         assets,
         quality,
-        (pct, t) => {
-          setProgress(pct);
-          setRenderedTime(t);
-        },
+        updateProgressMetrics,
         controller.signal,
-        activeRange
+        activeRange,
+        seqFormat,
+        waitIfPaused
       );
       triggerDownload(result.blob, result.filename, 'png-seq');
     } catch (err) {
       if (!controller.signal.aborted) {
-        setErrorMsg(err instanceof Error ? err.message : 'Erro ao exportar sequência PNG.');
+        setErrorMsg(err instanceof Error ? err.message : 'Erro ao exportar sequência de imagens.');
         setStatus('error');
       } else {
         setStatus('idle');
       }
     }
+  };
+
+  const exportSubtitlesFile = (format: 'srt' | 'vtt') => {
+    const content = serializeClipsToSubtitles(project.clips, format);
+    const safeName = project.projectName.trim().toLowerCase().replace(/[^a-z0-9-_]+/gi, '-') || 'legendas';
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `${safeName}.${format}`;
+    a.click();
   };
 
   const startWavExport = async () => {
@@ -245,6 +295,20 @@ export const ExportModal: React.FC<ExportModalProps> = ({
 
               <div className="grid grid-cols-2 gap-2 text-xs">
                 <div>
+                  <label className="text-[#a1a1aa] block mb-1">Formato / Contêiner</label>
+                  <select
+                    aria-label="Formato de contêiner"
+                    value={project.transparentBg ? 'webm' : container}
+                    disabled={!!project.transparentBg}
+                    onChange={(e) => setContainer(e.target.value as 'webm' | 'mp4')}
+                    className="w-full bg-[#18181c] border border-[#27272a] rounded-lg px-2.5 py-1.5 text-[#f4f4f5]"
+                  >
+                    <option value="webm">WebM (VP8 + Opus)</option>
+                    <option value="mp4">MP4 (H.264 + AAC/Opus)</option>
+                  </select>
+                </div>
+
+                <div>
                   <label className="text-[#a1a1aa] block mb-1">Intervalo</label>
                   <select
                     aria-label="Intervalo de renderização"
@@ -256,19 +320,19 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                     <option value="workArea">Área de Trabalho (B..N)</option>
                   </select>
                 </div>
+              </div>
 
-                <div>
-                  <label className="text-[#a1a1aa] block mb-1">Bitrate ({bitrateMbps} Mbps)</label>
-                  <input
-                    type="range"
-                    min={2}
-                    max={30}
-                    step={1}
-                    value={bitrateMbps}
-                    onChange={(e) => setBitrateMbps(Number(e.target.value))}
-                    className="studio-slider w-full mt-2.5"
-                  />
-                </div>
+              <div className="text-xs">
+                <label className="text-[#a1a1aa] block mb-1">Bitrate ({bitrateMbps} Mbps)</label>
+                <input
+                  type="range"
+                  min={2}
+                  max={30}
+                  step={1}
+                  value={bitrateMbps}
+                  onChange={(e) => setBitrateMbps(Number(e.target.value))}
+                  className="studio-slider w-full mt-1"
+                />
               </div>
 
               <div className="grid grid-cols-2 gap-2 text-xs">
@@ -323,7 +387,11 @@ export const ExportModal: React.FC<ExportModalProps> = ({
               <div className="rounded-lg bg-[#18181c] border border-[#27272a] p-3 space-y-1.5 text-xs">
                 <div className="flex justify-between">
                   <span className="text-[#71717a]">Contêiner / Codec real</span>
-                  <span className="font-mono-code text-[#f4f4f5]">WebM • VP8 + Opus</span>
+                  <span className="font-mono-code text-[#f4f4f5]">
+                    {container === 'mp4' && !project.transparentBg
+                      ? 'MP4 • H.264 + AAC/Opus'
+                      : 'WebM • VP8 + Opus'}
+                  </span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-[#71717a]">Tamanho estimado</span>
@@ -365,7 +433,9 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                   className="w-full py-2.5 px-4 rounded-lg bg-[#2563eb] hover:bg-[#3b82f6] text-white text-xs font-semibold flex items-center justify-center gap-2 transition-colors cursor-pointer"
                 >
                   <Download className="w-4 h-4" />
-                  <span>Renderizar e Baixar Vídeo (.webm)</span>
+                  <span>
+                    Renderizar e Baixar Vídeo (.{container === 'mp4' && !project.transparentBg ? 'mp4' : 'webm'})
+                  </span>
                 </button>
 
                 <p className="text-[10px] leading-relaxed text-[#71717a]">
@@ -375,13 +445,25 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                 </p>
 
                 <div className="grid grid-cols-2 gap-2">
-                  <button
-                    onClick={startPngSequenceExport}
-                    className="py-2 px-3 rounded-lg bg-[#18181c] hover:bg-[#27272a] border border-[#27272a] text-[#a1a1aa] hover:text-white text-[11px] font-medium flex items-center justify-center gap-1.5 cursor-pointer"
-                  >
-                    <Images className="w-3.5 h-3.5 text-[#60a5fa]" />
-                    <span>Sequência PNG (.tar)</span>
-                  </button>
+                  <div className="flex rounded-lg bg-[#18181c] border border-[#27272a] overflow-hidden">
+                    <button
+                      onClick={startPngSequenceExport}
+                      className="flex-1 py-2 px-2 hover:bg-[#27272a] text-[#a1a1aa] hover:text-white text-[11px] font-medium flex items-center justify-center gap-1 cursor-pointer"
+                    >
+                      <Images className="w-3.5 h-3.5 text-[#60a5fa] shrink-0" />
+                      <span>Sequência ({seqFormat.toUpperCase()})</span>
+                    </button>
+                    <select
+                      aria-label="Formato da sequência de imagens"
+                      value={seqFormat}
+                      onChange={(e) => setSeqFormat(e.target.value as 'png' | 'webp' | 'jpeg')}
+                      className="bg-[#121215] border-l border-[#27272a] px-1.5 text-[10px] text-[#f4f4f5] cursor-pointer"
+                    >
+                      <option value="png">PNG</option>
+                      <option value="webp">WebP</option>
+                      <option value="jpeg">JPG</option>
+                    </select>
+                  </div>
 
                   <button
                     onClick={startWavExport}
@@ -389,6 +471,23 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                   >
                     <Music className="w-3.5 h-3.5 text-[#34d399]" />
                     <span>Exportar Áudio (.wav)</span>
+                  </button>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    onClick={() => exportSubtitlesFile('srt')}
+                    className="py-1.5 px-2.5 rounded-lg bg-[#18181c] hover:bg-[#27272a] border border-[#27272a] text-[#a1a1aa] hover:text-white text-[11px] font-medium flex items-center justify-center gap-1.5 cursor-pointer"
+                  >
+                    <FileText className="w-3.5 h-3.5 text-amber-400" />
+                    <span>Legendas (.SRT)</span>
+                  </button>
+                  <button
+                    onClick={() => exportSubtitlesFile('vtt')}
+                    className="py-1.5 px-2.5 rounded-lg bg-[#18181c] hover:bg-[#27272a] border border-[#27272a] text-[#a1a1aa] hover:text-white text-[11px] font-medium flex items-center justify-center gap-1.5 cursor-pointer"
+                  >
+                    <FileText className="w-3.5 h-3.5 text-sky-400" />
+                    <span>Legendas (.VTT)</span>
                   </button>
                 </div>
 
@@ -406,15 +505,21 @@ export const ExportModal: React.FC<ExportModalProps> = ({
             </>
           ) : status === 'rendering' ? (
             <div className="py-4 space-y-4 text-center">
-              <Loader2 className="w-8 h-8 text-[#3b82f6] animate-spin mx-auto" />
+              <Loader2 className={`w-8 h-8 text-[#3b82f6] mx-auto ${isPaused ? '' : 'animate-spin'}`} />
               <div>
                 <p className="text-sm font-semibold text-[#f4f4f5]">
-                  Renderizando composição quadro a quadro...
+                  {isPaused
+                    ? 'Renderização pausada'
+                    : 'Renderizando composição quadro a quadro...'}
                 </p>
                 <p className="font-mono-code text-xs text-[#71717a] mt-1">
                   {formatTimecode(renderedTime, true, project.fps)} /{' '}
                   {formatTimecode(targetDuration, true, project.fps)} ({progress}%)
                 </p>
+                <div className="flex items-center justify-center gap-3 mt-1.5 text-[11px] font-mono-code text-[#a1a1aa]">
+                  <span>Velocidade: {renderSpeedFps} fps</span>
+                  {etaSec !== null && <span>ETA: ~{etaSec}s</span>}
+                </div>
               </div>
 
               <div className="w-full h-2 rounded-full bg-[#1c1c21] overflow-hidden">
@@ -424,12 +529,28 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                 />
               </div>
 
-              <button
-                onClick={() => abortRef.current?.abort()}
-                className="px-4 py-1.5 rounded-lg bg-[#1c1c21] hover:bg-[#27272a] border border-[#27272a] text-xs text-[#a1a1aa] cursor-pointer"
-              >
-                Cancelar
-              </button>
+              <div className="flex items-center justify-center gap-2">
+                <button
+                  onClick={() => {
+                    const next = !isPaused;
+                    pausedRef.current = next;
+                    setIsPaused(next);
+                  }}
+                  className="px-3.5 py-1.5 rounded-lg bg-[#18181c] hover:bg-[#27272a] border border-[#27272a] text-xs text-[#f4f4f5] flex items-center gap-1.5 cursor-pointer"
+                >
+                  {isPaused ? <Play className="w-3.5 h-3.5" /> : <Pause className="w-3.5 h-3.5" />}
+                  <span>{isPaused ? 'Retomar' : 'Pausar'}</span>
+                </button>
+                <button
+                  onClick={() => {
+                    pausedRef.current = false;
+                    abortRef.current?.abort();
+                  }}
+                  className="px-4 py-1.5 rounded-lg bg-[#1c1c21] hover:bg-[#27272a] border border-[#27272a] text-xs text-[#a1a1aa] cursor-pointer"
+                >
+                  Cancelar
+                </button>
+              </div>
             </div>
           ) : (
             <div className="py-2 space-y-3 text-center">

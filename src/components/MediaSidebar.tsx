@@ -222,16 +222,16 @@ export const MediaSidebar: React.FC<MediaSidebarProps> = ({
             >
               <Upload className="w-4 h-4 mx-auto mb-1 text-[#3b82f6]" />
               <p className="text-xs font-medium text-[#f4f4f5]">
-                Importar Vídeo, Foto, Áudio, 3D ou Lottie
+                Importar Vídeo, Foto, Áudio, 3D, Lottie ou Legendas
               </p>
               <p className="text-[10px] text-[#71717a] mt-0.5">
-                Arraste arquivos ou clique (MP4, WebM, PNG, SVG, MP3, GLB, GLTF, JSON)
+                Arraste arquivos ou clique (MP4, WebM, PNG, SVG, MP3, GLB, JSON, SRT, VTT)
               </p>
               <input
                 ref={fileInputRef}
                 type="file"
                 multiple
-                accept="video/*,image/*,audio/*,.glb,.gltf,.json,.svg"
+                accept="video/*,image/*,audio/*,.glb,.gltf,.json,.svg,.srt,.vtt"
                 className="hidden"
                 onChange={(e) => {
                   if (e.target.files?.length) {

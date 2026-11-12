@@ -80,6 +80,19 @@ function tokenize(source: string): Token[] {
       i++;
       continue;
     }
+    if (ch === '>' || ch === '<' || ch === '=' || ch === '!') {
+      const two = source.slice(i, i + 2);
+      if (two === '>=' || two === '<=' || two === '==' || two === '!=') {
+        tokens.push({ kind: 'op', val: two });
+        i += 2;
+        continue;
+      }
+      if (ch === '>' || ch === '<') {
+        tokens.push({ kind: 'op', val: ch });
+        i++;
+        continue;
+      }
+    }
     if (ch === '(' || ch === ')') {
       tokens.push({ kind: 'paren', val: ch });
       i++;
@@ -109,11 +122,34 @@ class SafeParser {
 
   parseExpression(): number {
     if (this.tokens.length === 0) return this.ctx.value;
-    const result = this.parseAddSub();
+    const result = this.parseComparison();
     if (this.pos < this.tokens.length) {
       throw new Error(' Expressão incompleta ou parêntese inesperado.');
     }
     return result;
+  }
+
+  private parseComparison(): number {
+    let left = this.parseAddSub();
+    while (true) {
+      const next = this.peek();
+      if (
+        !next ||
+        next.kind !== 'op' ||
+        !['>', '<', '>=', '<=', '==', '!='].includes(next.val)
+      ) {
+        break;
+      }
+      this.consume();
+      const right = this.parseAddSub();
+      if (next.val === '>') left = left > right ? 1 : 0;
+      else if (next.val === '<') left = left < right ? 1 : 0;
+      else if (next.val === '>=') left = left >= right ? 1 : 0;
+      else if (next.val === '<=') left = left <= right ? 1 : 0;
+      else if (next.val === '==') left = Math.abs(left - right) < 1e-6 ? 1 : 0;
+      else if (next.val === '!=') left = Math.abs(left - right) >= 1e-6 ? 1 : 0;
+    }
+    return left;
   }
 
   private parseAddSub(): number {
@@ -163,7 +199,7 @@ class SafeParser {
 
     if (tok.kind === 'paren' && tok.val === '(') {
       this.consume();
-      const inner = this.parseAddSub();
+      const inner = this.parseComparison();
       const close = this.peek();
       if (!close || close.kind !== 'paren' || close.val !== ')') {
         throw new Error('Falta fechar parêntese ")".');
@@ -179,10 +215,10 @@ class SafeParser {
         this.consume(); // '('
         const args: number[] = [];
         if (!(this.peek()?.kind === 'paren' && (this.peek() as { val: string }).val === ')')) {
-          args.push(this.parseAddSub());
+          args.push(this.parseComparison());
           while (this.peek()?.kind === 'comma') {
             this.consume();
-            args.push(this.parseAddSub());
+            args.push(this.parseComparison());
           }
         }
         const close = this.peek();
@@ -284,10 +320,68 @@ class SafeParser {
         const tri = cycle <= 1 ? cycle : 2 - cycle;
         return this.ctx.value + (tri * 2 - 1) * amp;
       }
+      case 'loopOut': {
+        const period = Math.max(0.05, args[0] ?? 1);
+        const amp = args[1] ?? 20;
+        const u = (this.ctx.relTime % period) / period;
+        return this.ctx.value + u * amp;
+      }
+      case 'loopIn': {
+        const period = Math.max(0.05, args[0] ?? 1);
+        const amp = args[1] ?? 20;
+        const u = 1 - ((this.ctx.relTime % period) / period);
+        return this.ctx.value + u * amp;
+      }
+      case 'posterizeTime':
+      case 'posterize': {
+        const rate = Math.max(1, args[0] ?? 12);
+        const speed = args[1] ?? 20;
+        const quantT = Math.floor(this.ctx.relTime * rate) / rate;
+        return this.ctx.value + quantT * speed;
+      }
+      case 'random': {
+        const min = args.length >= 2 ? args[0] : 0;
+        const max = args.length >= 2 ? args[1] : (args[0] ?? 1);
+        const seed = args[2] ?? this.ctx.seed;
+        const h = (hash1D(Math.floor(this.ctx.time * this.ctx.fps) + seed * 13.7) + 1) * 0.5;
+        return min + h * (max - min);
+      }
+      case 'noise': {
+        const x = args[0] ?? this.ctx.time;
+        const seed = args[1] ?? this.ctx.seed;
+        return smoothNoise1D(x, seed);
+      }
+      case 'if': {
+        const cond = args[0] ?? 0;
+        return Math.abs(cond) > 1e-9 ? (args[1] ?? this.ctx.value) : (args[2] ?? this.ctx.value);
+      }
+      case 'lerp': {
+        const a = args[0] ?? 0;
+        const b = args[1] ?? 100;
+        const u = Math.max(0, Math.min(1, args[2] ?? 0.5));
+        return a + (b - a) * u;
+      }
+      case 'smoothstep': {
+        const e0 = args[0] ?? 0;
+        const e1 = args[1] ?? 1;
+        const x = args[2] ?? t;
+        const u = Math.max(0, Math.min(1, (x - e0) / Math.max(1e-6, e1 - e0)));
+        return u * u * (3 - 2 * u);
+      }
       case 'sin':
         return Math.sin(args[0] ?? 0);
       case 'cos':
         return Math.cos(args[0] ?? 0);
+      case 'tan':
+        return Math.tan(args[0] ?? 0);
+      case 'atan2':
+        return Math.atan2(args[0] ?? 0, args[1] ?? 1);
+      case 'exp':
+        return Math.exp(Math.min(20, args[0] ?? 0));
+      case 'log':
+        return Math.log(Math.max(1e-9, args[0] ?? 1));
+      case 'sign':
+        return Math.sign(args[0] ?? 0);
       case 'abs':
         return Math.abs(args[0] ?? 0);
       case 'sqrt':

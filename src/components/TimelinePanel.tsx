@@ -60,12 +60,13 @@ interface TimelinePanelProps extends PreviewControlsProps {
   currentTime: number;
   totalDuration: number;
   selectedClipId: string | null;
+  selectedClipIds?: string[];
   zoomPxPerSec: number;
   snapEnabled: boolean;
   onChangeZoom: (pxPerSec: number) => void;
   onToggleSnap: () => void;
   onSeek: (time: number) => void;
-  onSelectClip: (clipId: string | null) => void;
+  onSelectClip: (clipId: string | null, additive?: boolean) => void;
   onSplitAtPlayhead: () => void;
   onDuplicateSelected: () => void;
   onDeleteSelected: (ripple?: boolean) => void;
@@ -94,6 +95,7 @@ export const TimelinePanel: React.FC<TimelinePanelProps> = ({
   currentTime,
   totalDuration,
   selectedClipId,
+  selectedClipIds = [],
   zoomPxPerSec,
   snapEnabled,
   onChangeZoom,
@@ -132,6 +134,7 @@ export const TimelinePanel: React.FC<TimelinePanelProps> = ({
       ? Math.min(300, Math.max(190, window.innerHeight * 0.34))
       : Math.min(360, Math.max(280, window.innerHeight * 0.4))
   );
+  const [hideShy, setHideShy] = useState(false);
   const minPanelHeight = compact ? 150 : 230;
 
   // Keep panel inside the viewport when the screen rotates / mode switches.
@@ -284,15 +287,64 @@ export const TimelinePanel: React.FC<TimelinePanelProps> = ({
     track: Track
   ) => {
     e.stopPropagation();
-    onSelectClip(clip.id);
-    if (track.locked) return;
+    const isAdditive = e.shiftKey || e.ctrlKey || e.metaKey;
+    const isAlreadyInGroup = selectedClipIds.length > 1 && selectedClipIds.includes(clip.id);
+    if (isAdditive) {
+      onSelectClip(clip.id, true);
+      return;
+    }
+    if (!isAlreadyInGroup) {
+      onSelectClip(clip.id, false);
+    }
 
     const startClientX = e.clientX;
+    const startClientY = e.clientY;
+    let moved = false;
+    let longPressTriggered = false;
+
+    // Long-press on touch opens the quick clip action menu
+    const longPressTimer =
+      e.pointerType === 'touch'
+        ? window.setTimeout(() => {
+            if (!moved) {
+              longPressTriggered = true;
+              setContextMenu({
+                clipId: clip.id,
+                x: Math.max(12, Math.min(window.innerWidth - 220, startClientX - 80)),
+                y: Math.max(12, Math.min(window.innerHeight - 280, startClientY - 180)),
+              });
+            }
+          }, 460)
+        : null;
+
+    if (track.locked) {
+      const clearTouch = () => {
+        if (longPressTimer !== null) window.clearTimeout(longPressTimer);
+        window.removeEventListener('pointerup', clearTouch);
+        window.removeEventListener('pointercancel', clearTouch);
+      };
+      window.addEventListener('pointerup', clearTouch);
+      window.addEventListener('pointercancel', clearTouch);
+      return;
+    }
+
     const origStart = clip.startTime;
     const origDuration = clip.duration;
-    let moved = false;
+    const groupIds = isAlreadyInGroup ? selectedClipIds : [clip.id];
+    const groupOrigStarts = new Map<string, number>();
+    for (const gid of groupIds) {
+      const gc = clips.find((c) => c.id === gid);
+      const gt = gc ? tracks.find((t) => t.id === gc.trackId) : undefined;
+      if (gc && !gt?.locked) {
+        groupOrigStarts.set(gid, gc.startTime);
+      }
+    }
 
     const onMove = (ev: PointerEvent) => {
+      if (longPressTriggered) return;
+      if (Math.hypot(ev.clientX - startClientX, ev.clientY - startClientY) > 7) {
+        if (longPressTimer !== null) window.clearTimeout(longPressTimer);
+      }
       const dxSec = (ev.clientX - startClientX) / zoomPxPerSec;
       let nextStart = Math.max(0, origStart + dxSec);
 
@@ -308,7 +360,7 @@ export const TimelinePanel: React.FC<TimelinePanelProps> = ({
 
       let targetTrackId = clip.trackId;
       const scroller = scrollContainerRef.current;
-      if (scroller) {
+      if (scroller && groupOrigStarts.size <= 1) {
         const rect = scroller.getBoundingClientRect();
         const relY = ev.clientY - rect.top + scroller.scrollTop - 48;
         const hoveredIdx = Math.floor(relY / TRACK_HEIGHT);
@@ -325,13 +377,25 @@ export const TimelinePanel: React.FC<TimelinePanelProps> = ({
       }
 
       moved = true;
-      onUpdateClipLive(clip.id, {
-        startTime: Math.round(nextStart * fps) / fps,
-        trackId: targetTrackId,
-      });
+      const roundedNextStart = Math.round(nextStart * fps) / fps;
+      const appliedDelta = roundedNextStart - origStart;
+
+      if (groupOrigStarts.size > 1) {
+        for (const [gid, gStart] of groupOrigStarts.entries()) {
+          onUpdateClipLive(gid, {
+            startTime: Math.max(0, Math.round((gStart + appliedDelta) * fps) / fps),
+          });
+        }
+      } else {
+        onUpdateClipLive(clip.id, {
+          startTime: roundedNextStart,
+          trackId: targetTrackId,
+        });
+      }
     };
 
     const onUp = () => {
+      if (longPressTimer !== null) window.clearTimeout(longPressTimer);
       setSnapGuideTime(null);
       if (moved) onCommitHistory();
       window.removeEventListener('pointermove', onMove);
@@ -492,6 +556,27 @@ export const TimelinePanel: React.FC<TimelinePanelProps> = ({
     const availW = Math.max(240, scroller.clientWidth - HEADER_WIDTH - 48);
     const ideal = Math.max(15, Math.min(160, Math.floor(availW / Math.max(4, totalDuration))));
     onChangeZoom(ideal);
+  };
+
+  const handleStaggerClips = () => {
+    const targetIds =
+      selectedClipIds.length >= 2
+        ? selectedClipIds
+        : selectedClip
+        ? clips.filter((c) => c.trackId === selectedClip.trackId).map((c) => c.id)
+        : [];
+    if (targetIds.length < 2) return;
+    const sorted = clips
+      .filter((c) => targetIds.includes(c.id))
+      .sort((a, b) => a.startTime - b.startTime);
+    const baseStart = sorted[0].startTime;
+    const stepSec = Math.round(0.25 * fps) / fps;
+    sorted.forEach((c, idx) => {
+      onUpdateClipLive(c.id, {
+        startTime: Number((baseStart + idx * stepSec).toFixed(4)),
+      });
+    });
+    onCommitHistory();
   };
 
   return (
@@ -673,6 +758,28 @@ export const TimelinePanel: React.FC<TimelinePanelProps> = ({
 
         {/* Right Snapping & Timeline Zoom */}
         <div className="flex items-center gap-2 shrink-0">
+          <button
+            onClick={handleStaggerClips}
+            title="Sequenciar / Stagger: desloca camadas selecionadas em cascata (0.25s)"
+            className="px-2 py-1 rounded-md text-[11px] font-medium flex items-center gap-1 border bg-[#1c1c21] hover:bg-[#27272a] border-[#27272a] text-[#a1a1aa] hover:text-[#f4f4f5] transition-colors cursor-pointer"
+          >
+            <Layers className="w-3.5 h-3.5 text-[#38bdf8]" />
+            <span className="hidden lg:inline">Cascata</span>
+          </button>
+
+          <button
+            onClick={() => setHideShy((v) => !v)}
+            title="Ocultar / Mostrar camadas marcadas como Shy na timeline"
+            className={`px-2 py-1 rounded-md text-[11px] font-medium flex items-center gap-1 border transition-colors cursor-pointer ${
+              hideShy
+                ? 'bg-sky-500/20 border-sky-400/60 text-sky-300'
+                : 'bg-[#1c1c21] border-[#27272a] text-[#71717a]'
+            }`}
+          >
+            <EyeOff className="w-3.5 h-3.5" />
+            <span className="hidden lg:inline">Shy</span>
+          </button>
+
           <button
             onClick={onToggleSnap}
             title="Alinhamento Magnético (Ímã)"
@@ -865,7 +972,9 @@ export const TimelinePanel: React.FC<TimelinePanelProps> = ({
           {/* Track Rows Stack */}
           <div className="relative">
             {tracks.map((track) => {
-              const trackClips = clips.filter((c) => c.trackId === track.id);
+              const trackClips = clips.filter(
+                (c) => c.trackId === track.id && (!hideShy || !c.shy)
+              );
 
               return (
                 <React.Fragment key={track.id}>
@@ -1022,7 +1131,9 @@ export const TimelinePanel: React.FC<TimelinePanelProps> = ({
                     {trackClips.map((clip) => {
                       const leftPx = clip.startTime * zoomPxPerSec;
                       const widthPx = Math.max(18, clip.duration * zoomPxPerSec);
-                      const isSelected = clip.id === selectedClipId;
+                      const isPrimarySelected = clip.id === selectedClipId;
+                      const isMultiSelected = selectedClipIds.includes(clip.id);
+                      const isSelected = isPrimarySelected || isMultiSelected;
 
                       const bgStyle =
                         clip.type === 'video' || clip.type === 'image' || clip.type === 'svg'
@@ -1063,6 +1174,8 @@ export const TimelinePanel: React.FC<TimelinePanelProps> = ({
                           style={{
                             left: `${leftPx}px`,
                             width: `${widthPx}px`,
+                            borderLeftColor: clip.labelColor || undefined,
+                            borderLeftWidth: clip.labelColor ? '4px' : undefined,
                           }}
                           onPointerDown={(e) => handleClipBodyMouseDown(e, clip, track)}
                           onDoubleClick={(e) => {
@@ -1081,8 +1194,10 @@ export const TimelinePanel: React.FC<TimelinePanelProps> = ({
                             });
                           }}
                           className={`group/clip touch-none absolute top-1 bottom-1 rounded-md border overflow-hidden cursor-grab active:cursor-grabbing select-none ${bgStyle} ${
-                            isSelected
+                            isPrimarySelected
                               ? 'ring-2 ring-[#3b82f6] border-white z-10 shadow-lg'
+                              : isMultiSelected
+                              ? 'ring-2 ring-cyan-400 border-cyan-200 z-10 shadow-md'
                               : 'hover:brightness-110'
                           }`}
                         >
@@ -1137,7 +1252,17 @@ export const TimelinePanel: React.FC<TimelinePanelProps> = ({
                           )}
 
                           <div className="relative z-10 px-2.5 py-1 flex items-center justify-between gap-1 pointer-events-none">
-                            <span className="text-[11px] font-medium text-white truncate drop-shadow">
+                            <span className="text-[11px] font-medium text-white truncate drop-shadow flex items-center gap-1">
+                              {clip.solo && (
+                                <span className="px-1 py-0.2 rounded bg-amber-400 text-black text-[8px] font-bold">
+                                  SOLO
+                                </span>
+                              )}
+                              {clip.guideLayer && (
+                                <span className="px-1 py-0.2 rounded bg-emerald-400 text-black text-[8px] font-bold">
+                                  GUIA
+                                </span>
+                              )}
                               {clip.type === 'text' && clip.textStyle
                                 ? clip.textStyle.text
                                 : clip.name}

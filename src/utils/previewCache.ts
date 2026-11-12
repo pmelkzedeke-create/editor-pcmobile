@@ -100,48 +100,55 @@ export async function prepareMediaFrame(
         const video = pool.getVideo(clip.id, asset.url);
         video.muted = true;
         const currentSourceTime = getClipSourceTime(clip, time - clip.startTime);
-        await seekVideoFrame(video, currentSourceTime, signal);
-        pool.storeTemporalSample(clip.id, currentSourceTime, video);
-
-        // Pre-sample frames for S_TimeSlice / S_ForceMotionBlur if active on this video clip
-        const sliceEffect = clip.effects?.find((e) => e.type === 'S_TimeSlice' && e.enabled);
-        const fmb = clip.effects?.find((e) => e.type === 'S_ForceMotionBlur' && e.enabled);
-        if (sliceEffect || fmb) {
-          const sampleTimes: number[] = [];
-          if (sliceEffect) {
-            const evalParams = evaluateEffectParams(sliceEffect, time - clip.startTime);
-            const sampleList = calculateTimeSliceTimes(
-              currentSourceTime,
-              evalParams as unknown as TimeSliceParams,
-              project.fps,
-              asset.duration
-            );
-            sampleTimes.push(...sampleList.map((s) => s.time));
-          }
-          if (fmb) {
-            // Amostras dentro do shutter angle (metade antes, metade depois)
-            const fp = evaluateEffectParams(fmb, time - clip.startTime);
-            const shutterSec = ((fp.shutterAngle ?? 180) / 360) / Math.max(1, project.fps);
-            const count = Math.max(2, Math.round(fp.samples ?? 12));
-            for (let s = 0; s < count; s++) {
-              const u = count === 1 ? 0 : s / (count - 1) - 0.5;
-              sampleTimes.push(currentSourceTime + u * shutterSec);
-            }
-          }
-          const uniqueTimes = [...new Set(sampleTimes.map((s) => Math.round(s * 30) / 30))];
-          for (const sampleT of uniqueTimes) {
-            checkAborted(signal);
-            if (sampleT < 0 || sampleT >= asset.duration) continue;
-            if (!pool.getTemporalSample(clip.id, sampleT)) {
-              await seekVideoFrame(video, sampleT, signal);
-              pool.storeTemporalSample(clip.id, sampleT, video);
-            }
-          }
+        pool.suppressNotify++;
+        try {
           await seekVideoFrame(video, currentSourceTime, signal);
+          pool.storeTemporalSample(clip.id, currentSourceTime, video);
+
+          // Pre-sample frames for S_TimeSlice / S_ForceMotionBlur if active on this video clip
+          const sliceEffect = clip.effects?.find((e) => e.type === 'S_TimeSlice' && e.enabled);
+          const fmb = clip.effects?.find((e) => e.type === 'S_ForceMotionBlur' && e.enabled);
+          if (sliceEffect || fmb) {
+            const sampleTimes: number[] = [];
+            if (sliceEffect) {
+              const evalParams = evaluateEffectParams(sliceEffect, time - clip.startTime);
+              const sampleList = calculateTimeSliceTimes(
+                currentSourceTime,
+                evalParams as unknown as TimeSliceParams,
+                project.fps,
+                asset.duration
+              );
+              sampleTimes.push(...sampleList.map((s) => s.time));
+            }
+            if (fmb) {
+              // Amostras dentro do shutter angle (metade antes, metade depois)
+              const fp = evaluateEffectParams(fmb, time - clip.startTime);
+              const shutterSec = ((fp.shutterAngle ?? 180) / 360) / Math.max(1, project.fps);
+              const count = Math.max(2, Math.round(fp.samples ?? 12));
+              for (let s = 0; s < count; s++) {
+                const u = count === 1 ? 0 : s / (count - 1) - 0.5;
+                sampleTimes.push(currentSourceTime + u * shutterSec);
+              }
+            }
+            const uniqueTimes = [...new Set(sampleTimes.map((s) => Math.round(s * 30) / 30))];
+            for (const sampleT of uniqueTimes) {
+              checkAborted(signal);
+              if (sampleT < 0 || sampleT >= asset.duration) continue;
+              if (!pool.getTemporalSample(clip.id, sampleT)) {
+                await seekVideoFrame(video, sampleT, signal);
+                pool.storeTemporalSample(clip.id, sampleT, video);
+              }
+            }
+            await seekVideoFrame(video, currentSourceTime, signal);
+          }
+        } finally {
+          pool.suppressNotify = Math.max(0, pool.suppressNotify - 1);
         }
       } else if (clip.type === 'image') {
         const image = pool.getImage(asset.url);
-        await image.decode();
+        if (!image.complete || image.naturalWidth === 0) {
+          await image.decode();
+        }
       }
     })
   );
@@ -179,20 +186,45 @@ export class PreviewFrameCache {
     return this.frames.get(this.frameIndex(time))?.bounds || [];
   }
 
-  store(index: number, blob: Blob, bounds: RenderedClipBounds[]) {
+  private putDecodedBitmap(index: number, bitmap: ImageBitmap) {
+    const prev = this.decoded.get(index);
+    if (prev && prev !== bitmap) prev.close();
+    this.decoded.delete(index);
+    this.decoded.set(index, bitmap);
+    while (this.decoded.size > 48) {
+      const oldest = this.decoded.keys().next().value!;
+      this.decoded.get(oldest)?.close();
+      this.decoded.delete(oldest);
+    }
+  }
+
+  store(index: number, blob: Blob, bounds: RenderedClipBounds[], bitmap?: ImageBitmap | null) {
     const previous = this.frames.get(index);
     const size = this.bytes + blob.size - (previous?.blob.size || 0);
     if (size > 192 * 1024 * 1024) {
+      bitmap?.close();
       throw new Error('Limite de cache de 192 MB atingido. Reduza a area de trabalho ou use qualidade 1/4.');
     }
     this.bytes = size;
     this.frames.set(index, { blob, bounds });
+    if (bitmap) {
+      this.putDecodedBitmap(index, bitmap);
+    }
   }
 
   /** Automatic rendering has a bounded working set; evict farthest frames first. */
-  storeAutomatic(index: number, blob: Blob, bounds: RenderedClipBounds[], playheadIndex: number) {
+  storeAutomatic(
+    index: number,
+    blob: Blob,
+    bounds: RenderedClipBounds[],
+    playheadIndex: number,
+    bitmap?: ImageBitmap | null
+  ) {
     const budget = 64 * 1024 * 1024;
-    if (blob.size > budget) return;
+    if (blob.size > budget) {
+      bitmap?.close();
+      return;
+    }
     const candidates = [...this.frames.keys()].sort((a, b) => Math.abs(b - playheadIndex) - Math.abs(a - playheadIndex));
     while ((this.bytes + blob.size > budget || this.frames.size >= 600) && candidates.length) {
       const oldest = candidates.shift()!;
@@ -201,7 +233,7 @@ export class PreviewFrameCache {
       this.decoded.get(oldest)?.close();
       this.decoded.delete(oldest);
     }
-    this.store(index, blob, bounds);
+    this.store(index, blob, bounds, bitmap);
   }
 
   decode(index: number): Promise<ImageBitmap | null> {
@@ -222,12 +254,7 @@ export class PreviewFrameCache {
           bitmap.close();
           return null;
         }
-        this.decoded.set(index, bitmap);
-        while (this.decoded.size > 18) {
-          const oldest = this.decoded.keys().next().value!;
-          this.decoded.get(oldest)?.close();
-          this.decoded.delete(oldest);
-        }
+        this.putDecodedBitmap(index, bitmap);
         return bitmap;
       })
       .finally(() => {
@@ -239,7 +266,7 @@ export class PreviewFrameCache {
 
   prefetch(time: number) {
     const index = this.frameIndex(time);
-    for (let i = 0; i < 8; i++) void this.decode(index + i).catch(() => {});
+    for (let i = 0; i < 12; i++) void this.decode(index + i).catch(() => {});
   }
 
   ranges(): WorkArea[] {
@@ -301,15 +328,20 @@ export async function renderPreviewRange(
             compositions: project.compositions,
           }
         );
-        const blob = await new Promise<Blob>((resolve, reject) =>
-          canvas.toBlob(
-            (value) => (value ? resolve(value) : reject(new Error('Falha ao armazenar um quadro.'))),
-            project.transparentBg ? 'image/png' : 'image/jpeg',
-            0.88
-          )
-        );
+        const [blob, bitmap] = await Promise.all([
+          new Promise<Blob>((resolve, reject) =>
+            canvas.toBlob(
+              (value) => (value ? resolve(value) : reject(new Error('Falha ao armazenar um quadro.'))),
+              project.transparentBg ? 'image/png' : 'image/jpeg',
+              0.86
+            )
+          ),
+          index - first < 36 && typeof createImageBitmap !== 'undefined'
+            ? createImageBitmap(canvas).catch(() => null)
+            : Promise.resolve(null),
+        ]);
         checkAborted(signal);
-        cache.store(index, blob, bounds);
+        cache.store(index, blob, bounds, bitmap);
       }
       if ((index - first) % 5 === 0 || index === last - 1) {
         onProgress(index - first + 1, last - first);

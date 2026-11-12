@@ -15,6 +15,7 @@ import {
 } from '../src/core/expressions';
 import {
   deleteKeyframesFromTrack,
+  evaluateClipVolume,
   evaluatePropertyTrack,
   resolveClipAnimation,
   shiftSelectedKeyframes,
@@ -30,7 +31,22 @@ import {
 import {
   computeAudioEnvelopeFromChannel,
   detectBeatsFromEnvelope,
+  sampleStereoAudioMeter,
 } from '../src/core/audioAnalysis';
+import {
+  buildSubtitleClips,
+  parseSubtitles,
+  serializeClipsToSubtitles,
+} from '../src/core/subtitles';
+import {
+  createEffect,
+  evaluateEffectParams,
+} from '../src/utils/sapphireEffects';
+import {
+  buildRotationGizmoPatch,
+  buildScaleGizmoPatch,
+  snapCanvasPosition,
+} from '../src/utils/canvasGizmos';
 import { buildInitialWorkspace } from '../src/utils/initialProject';
 import type { TimelineClip } from '../src/types/editor';
 
@@ -195,3 +211,127 @@ test('multi-composition creation, pre-composing, validation & audio beat detecti
   const beats = detectBeatsFromEnvelope(env, 60, 1.25, 0.35);
   assert.ok(beats.length >= 4, `expected rhythmic beats, got ${beats.length}`);
 });
+
+test('audio volume keyframes and stereo VU meter evaluate accurately over time', () => {
+  let clip = sampleClip();
+  clip = { ...clip, keyframes: upsertKeyframeOnClip(clip, 'volume', 0, 20, 'linear') };
+  clip = { ...clip, keyframes: upsertKeyframeOnClip(clip, 'volume', 2, 100, 'linear') };
+
+  assert.equal(Math.round(evaluateClipVolume(clip, 0)), 20);
+  assert.equal(Math.round(evaluateClipVolume(clip, 1)), 60);
+  assert.equal(Math.round(evaluateClipVolume(clip, 2)), 100);
+
+  const ws = buildInitialWorkspace();
+  const assetsMap = new Map(ws.assets.map((a) => [a.id, a]));
+  const meterMuted = sampleStereoAudioMeter(ws.project, assetsMap, 1.0, true);
+  assert.equal(meterMuted.left, 0);
+  assert.equal(meterMuted.db, -60);
+
+  const meterActive = sampleStereoAudioMeter(ws.project, assetsMap, 1.0, false);
+  assert.ok(meterActive.left > 0 && meterActive.right > 0);
+  assert.ok(meterActive.db > -60);
+});
+
+test('canvas gizmos snap to center/neighbors and update keyframed scale & rotation', () => {
+  const snappedCenter = snapCanvasPosition(0.9, -1.1, [{ id: 'other', x: 25, y: -30 }], 'self', false);
+  assert.equal(snappedCenter.x, 0);
+  assert.equal(snappedCenter.y, 0);
+  assert.equal(snappedCenter.snapLineX, 50);
+  assert.equal(snappedCenter.snapLineY, 50);
+
+  const snappedNeighbor = snapCanvasPosition(24.4, -29.2, [{ id: 'other', x: 25, y: -30 }], 'self', false);
+  assert.equal(snappedNeighbor.x, 25);
+  assert.equal(snappedNeighbor.y, -30);
+
+  let clip = sampleClip();
+  clip = { ...clip, keyframes: upsertKeyframeOnClip(clip, 'scale', 0, 100, 'linear') };
+  const scalePatch = buildScaleGizmoPatch(clip, 1.5, 145.4);
+  assert.equal(scalePatch.scale, 145);
+  assert.equal(scalePatch.keyframes?.find((k) => k.property === 'scale')?.keyframes.length, 2);
+
+  const rotPatch = buildRotationGizmoPatch(clip, 1.5, 28, true);
+  assert.equal(rotPatch.rotation, 30);
+});
+
+test('expanded expression engine supports conditionals, comparisons, loopOut, posterizeTime and lerp', () => {
+  const ctx = {
+    time: 1.5,
+    relTime: 0.75,
+    value: 100,
+    duration: 4,
+    fps: 30,
+    index: 1,
+    audioLevel: 0.6,
+    seed: 7,
+  };
+
+  const condTrue = evaluateSafeExpression('if(audioLevel > 0.4, value + 50, value - 20)', ctx);
+  assert.equal(condTrue.error, null);
+  assert.equal(condTrue.value, 150);
+
+  const condFalse = evaluateSafeExpression('if(audioLevel <= 0.4, value + 50, value - 20)', ctx);
+  assert.equal(condFalse.error, null);
+  assert.equal(condFalse.value, 80);
+
+  const loopOutVal = evaluateSafeExpression('loopOut(1.0, 40)', ctx);
+  assert.equal(loopOutVal.error, null);
+  assert.equal(Math.round(loopOutVal.value), 130);
+
+  const posterized = evaluateSafeExpression('posterizeTime(4, 20)', ctx);
+  assert.equal(posterized.error, null);
+  assert.equal(posterized.value, 115);
+
+  const lerped = evaluateSafeExpression('lerp(10, 90, 0.25)', ctx);
+  assert.equal(lerped.error, null);
+  assert.equal(lerped.value, 30);
+});
+
+test('subtitles engine parses and serializes .srt and .vtt accurately', () => {
+  const srtSample = `1
+00:00:01,000 --> 00:00:03,500
+Olá, bem-vindo ao Editor Pro!
+
+2
+00:00:04,000 --> 00:00:06,250
+Renderização WebCodecs em tempo real.`;
+
+  const cues = parseSubtitles(srtSample);
+  assert.equal(cues.length, 2);
+  assert.equal(cues[0].startTime, 1);
+  assert.equal(cues[0].endTime, 3.5);
+  assert.equal(cues[1].text, 'Renderização WebCodecs em tempo real.');
+
+  const clips = buildSubtitleClips(cues, 'track-t1');
+  assert.equal(clips.length, 2);
+  assert.equal(clips[0].duration, 2.5);
+  assert.equal(clips[1].startTime, 4);
+
+  const vttOut = serializeClipsToSubtitles(clips, 'vtt');
+  assert.ok(vttOut.startsWith('WEBVTT'));
+  assert.ok(vttOut.includes('00:00:01.000 --> 00:00:03.500'));
+
+  const reparsed = parseSubtitles(vttOut);
+  assert.equal(reparsed.length, 2);
+  assert.equal(reparsed[0].text, 'Olá, bem-vindo ao Editor Pro!');
+});
+
+test('new studio effects instantiate and evaluate keyframed parameters cleanly', () => {
+  const newTypes = [
+    'S_RadialBlur',
+    'S_TurbulentDisplace',
+    'S_BulgeTwirl',
+    'S_CornerPin',
+    'S_Halation',
+    'S_ThresholdInvert',
+    'S_BevelEmboss',
+    'S_Particles',
+  ];
+  for (const type of newTypes) {
+    const fx = createEffect(type);
+    assert.ok(fx, `effect ${type} should be registered`);
+    const evaluated = evaluateEffectParams(fx, 1.0);
+    assert.ok(Object.keys(evaluated).length > 0);
+  }
+});
+
+
